@@ -1,27 +1,46 @@
 import { isPnUser, isLidUser, jidDecode } from '@whiskeysockets/baileys'
 import { normalizePersonalJid, toNumber } from '../utils/identity.js'
-import { identityMappings } from './database/json.js'
+import { prepare, transaction } from './database/sqlite.js'
+import { getConfig } from './config.js'
 
 const pnToLid = new Map()
 const lidToPn = new Map()
 const negativeLookups = new Map()
 const inflight = new Map()
+const mappingListeners = new Set()
 
 let activeSocket = null
 let storeLoaded = false
+let lastWrittenAt = 0
 
 const MAX_CACHE = 10000
 const NEGATIVE_TTL_MS = 5 * 60_000
+
+export function subscribeIdentityMappings(listener) {
+    if (typeof listener !== 'function') return () => {}
+    mappingListeners.add(listener)
+    return () => {
+        mappingListeners.delete(listener)
+    }
+}
+
+function notifyMappingApplied(pnUser, lidUser) {
+    for (const listener of mappingListeners) {
+        try {
+            listener({ pn: pnUser, lid: lidUser })
+        } catch {}
+    }
+}
 
 function ensureLoaded() {
     if (storeLoaded) return
     storeLoaded = true
     try {
-        const stored = identityMappings.all()
-        for (const [pnUser, lidUser] of Object.entries(stored)) {
-            if (typeof pnUser !== 'string' || typeof lidUser !== 'string') continue
-            pnToLid.set(pnUser, lidUser)
-            lidToPn.set(lidUser, pnUser)
+        const rows = prepare('SELECT pn, lid FROM identity_map').all()
+        for (const row of rows) {
+            if (typeof row.pn !== 'string' || typeof row.lid !== 'string') continue
+            pnToLid.set(row.pn, row.lid)
+            lidToPn.set(row.lid, row.pn)
         }
     } catch {}
 }
@@ -91,18 +110,44 @@ async function coalesce(key, task) {
     return promise
 }
 
-export async function storeIdentityMapping(lid, pn, { syncRemote = true } = {}) {
-    const pair = normalizePair(lid, pn)
-    if (!pair) return false
+function identityLimit() {
+    const limit = Number(getConfig().identityMaxStored)
+    return Number.isFinite(limit) && limit > 0 ? Math.floor(limit) : 0
+}
 
-    const lidUser = jidUser(pair.lid)
-    const pnUser = jidUser(pair.pn)
-    if (!lidUser || !pnUser) return false
+function nextUpdatedAt() {
+    lastWrittenAt = Math.max(Date.now(), lastWrittenAt + 1)
+    return lastWrittenAt
+}
+
+function pruneStoredMappings() {
+    const limit = identityLimit()
+    if (limit <= 0) return
+
+    const count = prepare('SELECT count(*) AS total FROM identity_map').get().total
+    if (count <= limit) return
+
+    const excess = count - limit
+    prepare('DELETE FROM identity_map WHERE pn IN (SELECT pn FROM identity_map ORDER BY updated_at ASC, pn ASC LIMIT ?)').run(excess)
+}
+
+function persistPair(pnUser, lidUser) {
+    transaction(() => {
+        prepare('DELETE FROM identity_map WHERE lid = ? AND pn <> ?').run(lidUser, pnUser)
+        prepare('INSERT INTO identity_map(pn, lid, updated_at) VALUES (?, ?, ?) ON CONFLICT(pn) DO UPDATE SET lid = excluded.lid, updated_at = excluded.updated_at').run(pnUser, lidUser, nextUpdatedAt())
+        pruneStoredMappings()
+    })
+}
+
+function applyLocalPair(lidJid, pnJid) {
+    const lidUser = jidUser(lidJid)
+    const pnUser = jidUser(pnJid)
+    if (!lidUser || !pnUser) return null
 
     ensureLoaded()
 
     if (pnToLid.get(pnUser) === lidUser && lidToPn.get(lidUser) === pnUser) {
-        return false
+        return null
     }
 
     const previousLid = pnToLid.get(pnUser)
@@ -119,19 +164,33 @@ export async function storeIdentityMapping(lid, pn, { syncRemote = true } = {}) 
     negativeLookups.delete(`lid:${lidUser}`)
 
     try {
-        identityMappings.set(pnUser, lidUser)
-        if (previousPn && previousPn !== pnUser) identityMappings.delete(previousPn)
+        persistPair(pnUser, lidUser)
     } catch {}
 
-    const store = getMappingStore()
-    if (syncRemote && store?.storeLIDPNMappings) {
-        try {
-            await store.storeLIDPNMappings([
-                { lid: `${lidUser}@lid`, pn: `${pnUser}@s.whatsapp.net` }
-            ])
-        } catch {}
-    }
+    notifyMappingApplied(pnUser, lidUser)
 
+    return { lidUser, pnUser }
+}
+
+async function syncRemoteBatch(applied) {
+    const store = getMappingStore()
+    if (!store?.storeLIDPNMappings || !applied.length) return
+
+    try {
+        await store.storeLIDPNMappings(
+            applied.map(({ lidUser, pnUser }) => ({ lid: `${lidUser}@lid`, pn: `${pnUser}@s.whatsapp.net` }))
+        )
+    } catch {}
+}
+
+export async function storeIdentityMapping(lid, pn, { syncRemote = true } = {}) {
+    const pair = normalizePair(lid, pn)
+    if (!pair) return false
+
+    const applied = applyLocalPair(pair.lid, pair.pn)
+    if (!applied) return false
+
+    if (syncRemote) await syncRemoteBatch([applied])
     return true
 }
 
@@ -235,21 +294,27 @@ export function peekLIDForPN(pn) {
     return lidUser ? `${lidUser}@lid` : null
 }
 
-async function storePairs(pairs) {
+async function storePairs(pairs, { syncRemote = true } = {}) {
+    const applied = []
+
     for (const [a, b] of pairs) {
         if (!a || !b) continue
         const pair = normalizePair(a, b)
         if (!pair) continue
-        await storeIdentityMapping(pair.lid, pair.pn).catch(() => {})
+
+        const result = applyLocalPair(pair.lid, pair.pn)
+        if (result) applied.push(result)
     }
+
+    if (syncRemote) await syncRemoteBatch(applied)
 }
 
 export async function captureLidMappings(mappings) {
     if (!Array.isArray(mappings)) return
-    for (const mapping of mappings) {
-        if (!mapping?.lid || !mapping?.pn) continue
-        await storeIdentityMapping(mapping.lid, mapping.pn, { syncRemote: false }).catch(() => {})
-    }
+    await storePairs(
+        mappings.map(mapping => [mapping?.lid, mapping?.pn]).filter(([lid, pn]) => !!lid && !!pn),
+        { syncRemote: false }
+    )
 }
 
 export async function captureFromMessage(key) {
@@ -272,10 +337,14 @@ function contactPairs(contact) {
 
 export async function captureFromContacts(contacts) {
     if (!Array.isArray(contacts)) return
+
+    const pairs = []
     for (const contact of contacts) {
         if (!contact) continue
-        await storePairs(contactPairs(contact))
+        pairs.push(...contactPairs(contact))
     }
+
+    await storePairs(pairs)
 }
 
 export async function captureFromGroupMetadata(metadata) {
@@ -317,6 +386,26 @@ export async function resolveSenderIdentity(m) {
     return { jids, pn, lid: sender, number: pn ? toNumber(pn) : null }
 }
 
+export function peekSenderIdentity(m) {
+    const sender = normalizePersonalJid(m?.sender)
+        || normalizePersonalJid(m?.key?.participant)
+        || normalizePersonalJid(m?.key?.remoteJid)
+
+    if (!sender) return { jids: [], pn: null, lid: null, number: null }
+
+    if (isPnUser(sender)) {
+        const lid = peekLIDForPN(sender)
+        const jids = [sender]
+        if (lid) jids.push(lid)
+        return { jids, pn: sender, lid, number: toNumber(sender) }
+    }
+
+    const pn = peekPNForLID(sender)
+    const jids = [sender]
+    if (pn) jids.push(pn)
+    return { jids, pn, lid: sender, number: pn ? toNumber(pn) : null }
+}
+
 export function getResolverStats() {
     return {
         pnCount: pnToLid.size,
@@ -332,7 +421,8 @@ export function resetResolverState() {
     inflight.clear()
     activeSocket = null
     storeLoaded = false
+    lastWrittenAt = 0
     try {
-        identityMappings.setAll({})
+        prepare('DELETE FROM identity_map').run()
     } catch {}
 }

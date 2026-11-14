@@ -1,27 +1,31 @@
 export function parseCommand(m, prefixes) {
-    const text = m.text || ''
+    const text = String(m?.text || '')
     if (!text.trim()) return null
 
-    const prefix = prefixes.find(p => text.startsWith(p))
+    const body = text.replace(/^\s+/, '')
+    const prefix = prefixes.find(p => body.startsWith(p))
 
     if (prefix !== undefined) {
-        const body = text.slice(prefix.length).trim()
-        if (!body) return null
+        const after = body.slice(prefix.length).trim()
+        if (!after) return null
 
-        const parts = body.split(/\s+/)
+        const parts = after.split(/\s+/)
         const command = parts.shift().toLowerCase()
-        return { prefix, command, args: parts, text: parts.join(' ') }
+        const rawText = after.slice(command.length).trim()
+        return { prefix, command, args: parts, text: parts.join(' '), rawText }
     }
 
     const trimmed = text.trim()
     if (/\s/.test(trimmed)) return null
 
-    return { prefix: '', command: trimmed.toLowerCase(), args: [], text: '' }
+    return { prefix: '', command: trimmed.toLowerCase(), args: [], text: '', rawText: '' }
 }
 
 export function parseButtonResponse(m, prefixes) {
-    let body = m.text || ''
+    let body = String(m?.text || '')
     if (!body.trim()) return null
+
+    body = body.replace(/^\s+/, '')
 
     let prefix = ''
     for (const p of prefixes) {
@@ -32,11 +36,15 @@ export function parseButtonResponse(m, prefixes) {
         }
     }
 
-    const parts = body.trim().split(/\s+/).filter(Boolean)
-    if (!parts.length) return null
+    const trimmed = body.trim()
+    if (!trimmed) return null
 
+    const parts = trimmed.split(/\s+/).filter(Boolean)
     const command = parts.shift().toLowerCase()
-    return { prefix, command, args: parts, text: parts.join(' ') }
+    if (!command) return null
+
+    const rawText = trimmed.slice(command.length).trim()
+    return { prefix, command, args: parts, text: parts.join(' '), rawText }
 }
 
 export function matchPatternPlugin(m, patternPlugins) {

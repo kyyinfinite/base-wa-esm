@@ -6,8 +6,6 @@ import path from 'path'
 
 const tmpRt = fs.mkdtempSync(path.join(os.tmpdir(), 'wa-rt-'))
 process.env.WA_DATABASE_DIR = tmpRt
-process.env.WA_OWNER_PATH = path.join(tmpRt, 'owner.json')
-process.env.WA_PREMIUM_PATH = path.join(tmpRt, 'premium.json')
 process.env.WA_CONFIG_PATH = path.join(tmpRt, 'config.json')
 fs.writeFileSync(process.env.WA_CONFIG_PATH, JSON.stringify({
     botName: 'Uji Bot',
@@ -26,7 +24,7 @@ const { resetGroupCache } = await import('../src/services/group-cache.js')
 const { getGroup } = await import('../src/services/database/groups.js')
 const { storeOutgoingMessage, getMessageForRetry } = await import('../src/services/message-store.js')
 const { isDispatchableUpsertType, isDispatchableMessage } = await import('../src/core/app/upsert-filters.js')
-const { flushAll } = await import('../src/services/database/json.js')
+const { closeDatabase } = await import('../src/services/database/sqlite.js')
 
 const sleep = ms => new Promise(r => setTimeout(r, ms))
 
@@ -110,7 +108,7 @@ before(async () => {
 after(async () => {
     await closeActiveSocket()
     resetResolverState()
-    flushAll()
+    closeDatabase()
     fs.rmSync(tmpRt, { recursive: true, force: true })
 })
 
@@ -458,11 +456,24 @@ describe('upsert filters (phase 2)', () => {
         assert.equal(isDispatchableMessage(msg(undefined)), false)
     })
 
-    test('pesan tanpa konten dan echo BAE5 ditolak', () => {
+    test('pesan tanpa konten ditolak', () => {
         assert.equal(isDispatchableMessage({ key: { remoteJid: '628111@s.whatsapp.net', id: 'X' } }), false)
         assert.equal(isDispatchableMessage(null), false)
-        assert.equal(isDispatchableMessage(msg('628111@s.whatsapp.net', 'BAE5AABBCCDDEEFF')), false)
-        assert.equal(isDispatchableMessage(msg('628111@s.whatsapp.net', 'BAE5AABBCCDDEEFF0')), true)
+    })
+
+    test('pesan terlalu tua ditolak, pesan fromMe dan segar lolos', async () => {
+        const { isMessageTooOld } = await import('../src/core/app/upsert-filters.js')
+        const nowSec = Math.floor(Date.now() / 1000)
+        const old = { key: { remoteJid: '628111@s.whatsapp.net', id: 'OLD1', fromMe: false }, message: { conversation: 'menu' }, messageTimestamp: nowSec - 3600 }
+        const oldFromMe = { key: { remoteJid: '628111@s.whatsapp.net', id: 'OLD2', fromMe: true }, message: { conversation: 'menu' }, messageTimestamp: nowSec - 3600 }
+        const fresh = { key: { remoteJid: '628111@s.whatsapp.net', id: 'FRESH', fromMe: false }, message: { conversation: 'menu' }, messageTimestamp: nowSec - 5 }
+
+        assert.equal(isMessageTooOld(old), true)
+        assert.equal(isMessageTooOld(oldFromMe), false)
+        assert.equal(isMessageTooOld(fresh), false)
+        assert.equal(isDispatchableMessage(old), false)
+        assert.equal(isDispatchableMessage(oldFromMe), true)
+        assert.equal(isDispatchableMessage(fresh), true)
     })
 
     test('pesan ephemeral tetap lolos filter (tidak dibuang)', () => {

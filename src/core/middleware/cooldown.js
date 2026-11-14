@@ -10,10 +10,21 @@ function sweep(now) {
     }
 }
 
+function commandIdentity(handler) {
+    const command = handler?.command
+    if (command instanceof RegExp) return `pattern:${command.source}`
+    if (Array.isArray(command)) return String(command[0] || 'custom')
+    if (typeof command === 'string' && command.trim()) return command.trim().toLowerCase()
+
+    const pattern = handler?.customPrefix
+    if (pattern instanceof RegExp) return `pattern:${pattern.source}`
+    return 'custom'
+}
+
 export function getCooldownKey(ctx, handler) {
     const identity = ctx.identityKey || ctx.sender || 'unknown'
     const chat = ctx.chatKey || ctx.chat || 'unknown'
-    const command = ctx.command || handler.command?.toString?.() || 'custom'
+    const command = commandIdentity(handler)
     return `${identity}:${chat}:${command}`
 }
 

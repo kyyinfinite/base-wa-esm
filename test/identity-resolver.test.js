@@ -27,7 +27,7 @@ const {
     resolveSenderIdentity,
     getResolverStats
 } = await import('../src/services/identity-resolver.js')
-const { flushAll } = await import('../src/services/database/json.js')
+const { prepare, closeDatabase } = await import('../src/services/database/sqlite.js')
 
 const __dirname = path.dirname(fileURLToPath(import.meta.url))
 const resolverPath = path.resolve(__dirname, '../src/services/identity-resolver.js')
@@ -88,7 +88,7 @@ before(() => {
 
 after(() => {
     setResolverSocket(null)
-    flushAll()
+    closeDatabase()
     fs.rmSync(tmpRes, { recursive: true, force: true })
 })
 
@@ -500,16 +500,14 @@ describe('persistence mapping', () => {
     test('mapping tersimpan ke database lokal', async () => {
         setResolverSocket(makeSocket(makeMappingStore()))
         await storeIdentityMapping(LID_A, PN_A)
-        flushAll()
 
-        const raw = JSON.parse(fs.readFileSync(path.join(tmpRes, 'identity.json'), 'utf8'))
-        assert.equal(raw['628111222333'], '555444333222111')
+        const row = prepare('SELECT lid FROM identity_map WHERE pn = ?').get('628111222333')
+        assert.equal(row.lid, '555444333222111')
     })
 
     test('mapping tetap bisa dipakai setelah restart (proses baru)', async () => {
         setResolverSocket(makeSocket(makeMappingStore()))
         await captureFromMessage({ remoteJid: LID_A, remoteJidAlt: PN_A })
-        flushAll()
         setResolverSocket(null)
 
         const script = `
@@ -526,7 +524,6 @@ describe('persistence mapping', () => {
 
     test('Baileys tetap sumber utama saat cache lokal kosong', async () => {
         resetResolverState()
-        flushAll()
 
         const script = `
             const { setResolverSocket, resolvePN, getResolverStats } = await import(${JSON.stringify(pathToFileURL(resolverPath).href)})

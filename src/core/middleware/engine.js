@@ -57,6 +57,12 @@ export async function runMiddleware(ctx, handler) {
         if (result === true) return { allowed: true }
 
         if (result.allowed === false) {
+            try {
+                ctx._cooldownRelease?.()
+            } catch {}
+            try {
+                ctx._limitRefund?.()
+            } catch {}
             if (result.message) await ctx.notifReply(result.message, result.title || 'Access Denied')
             return result
         }

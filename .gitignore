@@ -4,3 +4,10 @@ session/
 *.tmp
 src/tmp/
 .DS_Store
+
+.run-tmp/
+database/logs/
+database/database.db
+database/database.db-wal
+database/database.db-shm
+database/backups/

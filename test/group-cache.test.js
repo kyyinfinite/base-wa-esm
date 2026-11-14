@@ -6,8 +6,6 @@ import path from 'path'
 
 const tmpGc = fs.mkdtempSync(path.join(os.tmpdir(), 'wa-gc-'))
 process.env.WA_DATABASE_DIR = tmpGc
-process.env.WA_OWNER_PATH = path.join(tmpGc, 'owner.json')
-process.env.WA_PREMIUM_PATH = path.join(tmpGc, 'premium.json')
 process.env.WA_CONFIG_PATH = path.join(tmpGc, 'config.json')
 fs.writeFileSync(process.env.WA_CONFIG_PATH, JSON.stringify({ botMode: 'public', prefix: ['.'], dailyLimit: 5, creator: [] }))
 

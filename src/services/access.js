@@ -1,85 +1,59 @@
-import fs from 'fs'
-import path from 'path'
-import { fileURLToPath } from 'url'
+import { prepare } from './database/sqlite.js'
 import { toUserJid, toNumber, getConfiguredNumbers } from '../utils/identity.js'
 
-const __dirname = path.dirname(fileURLToPath(import.meta.url))
-const dataDir = path.join(__dirname, '../database')
-const ownerPath = process.env.WA_OWNER_PATH || path.join(dataDir, 'owner.json')
-const premiumPath = process.env.WA_PREMIUM_PATH || path.join(dataDir, 'premium.json')
+const nowMs = () => Date.now()
 
-function readList(file) {
-    try {
-        const stat = fs.statSync(file)
-        const raw = JSON.parse(fs.readFileSync(file, 'utf8'))
-        return { list: Array.isArray(raw) ? raw : [], mtimeMs: stat.mtimeMs }
-    } catch {
-        return { list: [], mtimeMs: 0 }
+function createRoleStore(role) {
+    let cachedAll = null
+    let cachedNumbers = null
+
+    const invalidate = () => {
+        cachedAll = null
+        cachedNumbers = null
     }
-}
 
-function writeList(file, list) {
-    const temp = `${file}.tmp`
-    fs.writeFileSync(temp, JSON.stringify(list, null, 2))
-    fs.renameSync(temp, file)
-}
+    const loadAll = () => {
+        if (cachedAll) return cachedAll
 
-function createListStore(file) {
-    let cache = null
-    let cachedMtimeMs = -1
+        const rows = prepare('SELECT jid FROM access_roles WHERE role = ? AND (expires_at IS NULL OR expires_at > ?) ORDER BY created_at, number').all(role, nowMs())
+        cachedAll = rows.map(row => row.jid)
+        return cachedAll
+    }
 
-    const load = () => {
-        let mtimeMs = 0
-        try {
-            mtimeMs = fs.statSync(file).mtimeMs
-        } catch {}
-
-        if (cache && mtimeMs === cachedMtimeMs) return cache
-
-        const { list, mtimeMs: m } = readList(file)
-        cache = list
-        cachedMtimeMs = m
-        return cache
+    const numbers = () => {
+        if (!cachedNumbers) cachedNumbers = Object.freeze(getConfiguredNumbers(loadAll()))
+        return cachedNumbers
     }
 
     return {
-        all: () => load(),
-        numbers: () => getConfiguredNumbers(load()),
-        has: (value) => {
+        all: () => loadAll(),
+        numbers,
+        has: value => {
             const number = toNumber(value)
             if (!number) return false
-            return load().some(entry => getConfiguredNumbers(entry).includes(number))
+            return numbers().includes(number)
         },
-        add: (value) => {
+        add: value => {
             const jid = toUserJid(value)
             if (!jid) throw new TypeError('Nomor tidak valid')
 
-            const list = load()
             const number = toNumber(jid)
-            if (list.some(entry => getConfiguredNumbers(entry).includes(number))) return false
+            if (numbers().includes(number)) return false
 
-            list.push(jid)
-            writeList(file, list)
-            cache = list
-            cachedMtimeMs = fs.statSync(file).mtimeMs
+            prepare('INSERT INTO access_roles(number, role, jid, created_at, expires_at) VALUES (?, ?, ?, ?, NULL)').run(number, role, jid, nowMs())
+            invalidate()
             return true
         },
-        remove: (value) => {
+        remove: value => {
             const number = toNumber(value)
             if (!number) return false
 
-            const list = load()
-            const index = list.findIndex(entry => getConfiguredNumbers(entry).includes(number))
-            if (index === -1) return false
-
-            list.splice(index, 1)
-            writeList(file, list)
-            cache = list
-            cachedMtimeMs = fs.statSync(file).mtimeMs
-            return true
+            const result = prepare('DELETE FROM access_roles WHERE number = ? AND role = ?').run(number, role)
+            invalidate()
+            return result.changes > 0
         }
     }
 }
 
-export const owners = createListStore(ownerPath)
-export const premiums = createListStore(premiumPath)
+export const owners = createRoleStore('owner')
+export const premiums = createRoleStore('premium')

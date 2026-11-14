@@ -1,8 +1,18 @@
-const entries = []
+import fs from 'fs'
+import path from 'path'
+import { fileURLToPath } from 'url'
+import { getConfig } from './config.js'
+
+const __dirname = path.dirname(fileURLToPath(import.meta.url))
+const logDir = process.env.WA_LOG_DIR || path.join(__dirname, '../../database/logs')
+const logFile = path.join(logDir, 'bot.log')
 
 const MAX_ENTRIES = 500
 const MAX_DATA_STRING = 500
+const MAX_LOG_BYTES = 5 * 1024 * 1024
+const MAX_LOG_FILES = 3
 
+const entries = []
 const LEVELS = { debug: 10, info: 20, warn: 30, error: 40 }
 
 function sanitizeValue(value) {
@@ -28,6 +38,39 @@ function sanitizeValue(value) {
     return String(value).slice(0, MAX_DATA_STRING)
 }
 
+function rotateLogFile() {
+    try {
+        const oldest = `${logFile}.${MAX_LOG_FILES - 1}`
+        try {
+            fs.rmSync(oldest, { force: true })
+        } catch {}
+
+        for (let index = MAX_LOG_FILES - 2; index >= 1; index--) {
+            const source = `${logFile}.${index}`
+            const target = `${logFile}.${index + 1}`
+            try {
+                if (fs.existsSync(source)) fs.renameSync(source, target)
+            } catch {}
+        }
+
+        try {
+            if (fs.existsSync(logFile)) fs.renameSync(logFile, `${logFile}.1`)
+        } catch {}
+    } catch {}
+}
+
+function appendLogToFile(entry) {
+    try {
+        const stat = fs.statSync(logFile)
+        if (stat.size >= MAX_LOG_BYTES) rotateLogFile()
+    } catch {}
+
+    try {
+        if (!fs.existsSync(logDir)) fs.mkdirSync(logDir, { recursive: true })
+        fs.appendFileSync(logFile, `${JSON.stringify(entry)}\n`)
+    } catch {}
+}
+
 export function logStructured(level, subsystem, event, data = {}) {
     const normalized = LEVELS[level] ? level : 'info'
     const entry = {
@@ -41,6 +84,10 @@ export function logStructured(level, subsystem, event, data = {}) {
     entries.push(entry)
     if (entries.length > MAX_ENTRIES) {
         entries.splice(0, entries.length - MAX_ENTRIES)
+    }
+
+    if (getConfig().logToFile) {
+        appendLogToFile(entry)
     }
 
     return entry
@@ -67,6 +114,15 @@ export function getLogStats() {
         byLevel[entry.level] += 1
     }
     return { entries: entries.length, max: MAX_ENTRIES, byLevel }
+}
+
+export function getLogFileState() {
+    try {
+        const stat = fs.statSync(logFile)
+        return { file: logFile, bytes: stat.size, maxBytes: MAX_LOG_BYTES, maxFiles: MAX_LOG_FILES }
+    } catch {
+        return { file: logFile, bytes: 0, maxBytes: MAX_LOG_BYTES, maxFiles: MAX_LOG_FILES }
+    }
 }
 
 export function clearLogs() {

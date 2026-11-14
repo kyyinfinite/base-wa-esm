@@ -1,3 +1,5 @@
+import outbound, { bindOutboundSocket } from '../core/outbound/index.js'
+
 const VALID_PRESENCE = ['unavailable', 'available', 'composing', 'recording', 'paused']
 
 const requireConn = conn => {
@@ -22,7 +24,8 @@ export async function sendMessage(conn, jid, content, options = {}) {
     requireConn(conn)
     const target = requireJid(jid)
     if (!content || typeof content !== 'object') throw new TypeError('content harus berupa object')
-    return conn.sendMessage(target, content, options)
+    bindOutboundSocket(conn)
+    return outbound.send(target, content, options)
 }
 
 export async function replyMessage(conn, m, content, options = {}) {

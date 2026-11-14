@@ -4,6 +4,7 @@ import { fileURLToPath, pathToFileURL } from 'url'
 import { plugins, registerPlugin, unregisterPlugin, replacePlugin, getKeysOf, validatePlugin } from './registry.js'
 import { events } from '../events/engine.js'
 import { reportPluginError } from '../errors/engine.js'
+import { getConfig } from '../../services/config.js'
 
 const __dirname = path.dirname(fileURLToPath(import.meta.url))
 const defaultPluginDir = path.join(__dirname, '../../../plugins')
@@ -11,8 +12,15 @@ const defaultPluginDir = path.join(__dirname, '../../../plugins')
 const pluginCache = new Map()
 const watchers = new Map()
 const pendingReloads = new Map()
+const initializedDirs = new Set()
+const eventSubscriptions = new Map()
 
 let cacheCounter = 0
+let coreObject = null
+
+export function isPluginsLoaded(pluginDir = defaultPluginDir) {
+    return initializedDirs.has(pluginDir)
+}
 
 export function getPluginFiles(dir) {
     let files = []
@@ -25,6 +33,72 @@ export function getPluginFiles(dir) {
     return files
 }
 
+async function getCore() {
+    if (coreObject) return coreObject
+
+    const [transport, outboundModule, configModule] = await Promise.all([
+        import('../app/transport.js'),
+        import('../outbound/index.js'),
+        import('../../services/config.js')
+    ])
+
+    coreObject = {
+        bus: events,
+        outbound: outboundModule.default,
+        getSocket: transport.getActiveSocket,
+        config: configModule.getConfig
+    }
+
+    return coreObject
+}
+
+async function runInit(handler, file) {
+    if (typeof handler?.init !== 'function') return true
+
+    try {
+        const core = await getCore()
+        await handler.init(core)
+        return true
+    } catch (error) {
+        reportPluginError('plugin:init', error, { file })
+        events.emit('plugin:error', file, error)
+        return false
+    }
+}
+
+async function runDispose(handler, file) {
+    if (!handler || typeof handler.dispose !== 'function') return
+
+    try {
+        await handler.dispose()
+    } catch (error) {
+        reportPluginError('plugin:dispose', error, { file })
+    }
+}
+
+function subscribePluginEvents(file, handler) {
+    const map = handler?.on
+    if (!map || typeof map !== 'object' || Array.isArray(map)) return
+
+    const subs = []
+    for (const [event, listener] of Object.entries(map)) {
+        if (typeof listener !== 'function') continue
+        events.on(event, listener)
+        subs.push({ event, listener })
+    }
+
+    if (subs.length) eventSubscriptions.set(file, subs)
+}
+
+function unsubscribePluginEvents(file) {
+    const subs = eventSubscriptions.get(file)
+    if (!subs) return
+    for (const { event, listener } of subs) {
+        events.off(event, listener)
+    }
+    eventSubscriptions.delete(file)
+}
+
 export async function loadPlugin(file) {
     try {
         const cacheBust = `${Date.now()}-${cacheCounter++}`
@@ -35,12 +109,32 @@ export async function loadPlugin(file) {
 
         validatePlugin(handler)
 
-        if (pluginCache.has(file)) {
-            pluginCache.set(file, replacePlugin(file, pluginCache.get(file), handler))
+        const previous = pluginCache.has(file) ? pluginCache.get(file) : null
+        const previousHandler = previous && previous.length ? plugins.get(previous[0]) : null
+
+        if (previous) {
+            unsubscribePluginEvents(file)
+            await runDispose(previousHandler, file)
+            pluginCache.set(file, replacePlugin(file, previous, handler))
         } else {
             pluginCache.set(file, registerPlugin(file, handler))
         }
 
+        if (!(await runInit(handler, file))) {
+            const keys = pluginCache.get(file)
+            unregisterPlugin(file, keys)
+            pluginCache.delete(file)
+
+            if (previous) {
+                try {
+                    pluginCache.set(file, registerPlugin(file, previousHandler))
+                } catch {}
+            }
+
+            return null
+        }
+
+        subscribePluginEvents(file, handler)
         events.emit('plugin:file-loaded', file)
         return handler
     } catch (e) {
@@ -52,12 +146,21 @@ export async function loadPlugin(file) {
 
 export async function unloadPlugin(file) {
     if (!pluginCache.has(file)) return false
-    unregisterPlugin(file, pluginCache.get(file))
+
+    const keys = pluginCache.get(file)
+    const handler = keys && keys.length ? plugins.get(keys[0]) : null
+
+    unsubscribePluginEvents(file)
+    unregisterPlugin(file, keys)
     pluginCache.delete(file)
+    await runDispose(handler, file)
     return true
 }
 
 export async function initPlugins(pluginDir = defaultPluginDir) {
+    if (initializedDirs.has(pluginDir)) return pluginCache.size
+    initializedDirs.add(pluginDir)
+
     for (const file of getPluginFiles(pluginDir)) {
         await loadPlugin(file)
     }
@@ -67,6 +170,7 @@ export async function initPlugins(pluginDir = defaultPluginDir) {
 
 function watch(dir) {
     if (watchers.has(dir)) return
+    if (!getConfig().hotReload) return
 
     const watcher = fs.watch(dir, (_, filename) => {
         if (!filename || filename.startsWith('.')) return

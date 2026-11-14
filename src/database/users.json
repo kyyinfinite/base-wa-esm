@@ -1,1 +1,32 @@
-{}
+{
+  "6283815201912": {
+    "jid": "6283815201912@s.whatsapp.net",
+    "name": "Marky",
+    "firstSeen": "2026-11-13T21:49:24.578Z",
+    "lastSeen": "2026-11-13T22:02:44.890Z",
+    "limit": 10,
+    "premium": true,
+    "owner": true,
+    "creator": true
+  },
+  "6289530466289": {
+    "jid": "6289530466289@s.whatsapp.net",
+    "name": "𝗺𝗼𝘀𝘇𝘆",
+    "firstSeen": "2026-11-13T22:02:37.385Z",
+    "lastSeen": "2026-11-13T22:02:37.485Z",
+    "limit": 10,
+    "premium": false,
+    "owner": false,
+    "creator": false
+  },
+  "18202204330": {
+    "jid": "18202204330@s.whatsapp.net",
+    "name": "markyyy",
+    "firstSeen": "2026-11-13T22:02:45.525Z",
+    "lastSeen": "2026-11-13T22:02:45.525Z",
+    "limit": 10,
+    "premium": false,
+    "owner": false,
+    "creator": false
+  }
+}

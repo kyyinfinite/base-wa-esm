@@ -1,6 +1,6 @@
-
-
 import messageWrapper from './wrapper.js'
+import outbound from '../outbound/index.js'
+import { getAdminState as resolveAdminState } from '../middleware/admin.js'
 
 const toPayload = content => {
     if (typeof content === 'string') return { text: content }
@@ -51,10 +51,12 @@ export function createContext({
     m,
     args = [],
     text = '',
+    rawText = '',
     command = '',
     prefix = '',
     notifReply,
-    accessDenied = {}
+    accessDenied = {},
+    signal = null
 } = {}) {
     if (!conn) throw new TypeError('createContext requires a conn')
     if (!m) throw new TypeError('createContext requires a message')
@@ -65,7 +67,7 @@ export function createContext({
 
     const send = async (content, options = {}, chatId = chat) => {
         if (!chatId) throw new Error('Cannot send message: chat id is missing')
-        return conn.sendMessage(chatId, toPayload(content), options)
+        return outbound.send(chatId, toPayload(content), options)
     }
 
     const reply = async (content, options = {}) =>
@@ -77,7 +79,7 @@ export function createContext({
     const react = async (emoji) => {
         if (!m.key) throw new Error('Cannot react: message key is missing')
 
-        return conn.sendMessage(chat, {
+        return outbound.send(chat, {
             react: {
                 text: String(emoji ?? ''),
                 key: m.key
@@ -85,7 +87,7 @@ export function createContext({
         })
     }
 
-    return {
+    const context = {
         conn,
         m,
         message: m,
@@ -100,8 +102,10 @@ export function createContext({
 
         args: Array.isArray(args) ? args : [],
         text: String(text ?? ''),
+        rawText: String(rawText ?? ''),
         command: String(command ?? ''),
         prefix: String(prefix ?? ''),
+        signal,
 
         user,
         group,
@@ -129,6 +133,21 @@ export function createContext({
         msg: m.msg || null,
         quoted: m.quoted || null
     }
+
+    let adminStatePromise = null
+
+    context.getAdminState = async () => {
+        if (!adminStatePromise) {
+            adminStatePromise = resolveAdminState(context).then(state => {
+                context.isAdmin = state.isAdmin
+                context.isBotAdmin = state.isBotAdmin
+                return state
+            })
+        }
+        return adminStatePromise
+    }
+
+    return context
 }
 
 export default createContext

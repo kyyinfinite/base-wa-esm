@@ -6,14 +6,14 @@ import path from 'path'
 
 const tmpSec = fs.mkdtempSync(path.join(os.tmpdir(), 'wa-sec-'))
 process.env.WA_DATABASE_DIR = tmpSec
-process.env.WA_OWNER_PATH = path.join(tmpSec, 'owner.json')
-process.env.WA_PREMIUM_PATH = path.join(tmpSec, 'premium.json')
 
 const { isPersonalJid, toNumber, toUserJid, toLidJid, getConfiguredNumbers, normalizePersonalJid } = await import('../src/utils/identity.js')
 const { owners, premiums } = await import('../src/services/access.js')
 const { upsertUser } = await import('../src/services/database/users.js')
+const { prepare, closeDatabase } = await import('../src/services/database/sqlite.js')
 
 after(() => {
+    closeDatabase()
     fs.rmSync(tmpSec, { recursive: true, force: true })
 })
 
@@ -90,9 +90,9 @@ describe('access list service', () => {
         assert.equal(owners.all().filter(e => String(e).startsWith('628888')).length, 1)
     })
 
-    test('perubahan tersimpan ke file', () => {
-        const raw = JSON.parse(fs.readFileSync(process.env.WA_OWNER_PATH, 'utf8'))
-        assert.ok(raw.includes('628888@s.whatsapp.net'))
+    test('perubahan tersimpan ke tabel access_roles', () => {
+        const rows = prepare("SELECT jid FROM access_roles WHERE role = 'owner' AND number = ?").all('628888')
+        assert.deepEqual(rows.map(row => row.jid), ['628888@s.whatsapp.net'])
     })
 
     test('remove menghapus dan mengembalikan false untuk yang tidak ada', () => {

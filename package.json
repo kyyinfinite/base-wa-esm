@@ -1,13 +1,14 @@
 {
   "name": "base-wa-esm",
-  "version": "2.0.0",
+  "version": "2.1.0",
   "description": "Framework WhatsApp bot modular berbasis Baileys (JavaScript ESM)",
   "main": "index.js",
   "type": "module",
   "scripts": {
     "start": "node index.js",
     "test": "node --test",
-    "check": "node --check index.js"
+    "check": "node --check index.js",
+    "check:comments": "node scripts/check-no-comments.js"
   },
   "keywords": [
     "baileys",
@@ -18,16 +19,22 @@
   "author": "kyyinfinite",
   "license": "MIT",
   "engines": {
-    "node": ">=20"
+    "node": ">=20.9.0 <21 || >=22"
   },
   "dependencies": {
     "@whiskeysockets/baileys": "7.0.0-rc14",
     "axios": "^1.21.1",
+    "better-sqlite3": "12.11.1",
     "chalk": "^4.1.2",
     "fluent-ffmpeg": "^2.1.3",
     "human-readable": "^0.2.1",
     "moment-timezone": "^0.5.34",
+    "node-webpmux": "^3.2.1",
     "pino": "^8.17.2",
     "sharp": "^0.35.5"
+  },
+  "allowScripts": {
+    "better-sqlite3@12.11.1": true,
+    "sharp@0.35.5": true
   }
 }

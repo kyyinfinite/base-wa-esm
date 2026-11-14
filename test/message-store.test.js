@@ -6,21 +6,17 @@ import path from 'path'
 
 const tmpMs = fs.mkdtempSync(path.join(os.tmpdir(), 'wa-ms-'))
 process.env.WA_DATABASE_DIR = tmpMs
-process.env.WA_OWNER_PATH = path.join(tmpMs, 'owner.json')
-process.env.WA_PREMIUM_PATH = path.join(tmpMs, 'premium.json')
 process.env.WA_CONFIG_PATH = path.join(tmpMs, 'config.json')
 fs.writeFileSync(process.env.WA_CONFIG_PATH, JSON.stringify({ botMode: 'public', prefix: ['.'], dailyLimit: 5, creator: [] }))
 
 const { storeOutgoingMessage, getMessageForRetry, getMessageStoreStats, resetMessageStore } =
     await import('../src/services/message-store.js')
-const { flushAll } = await import('../src/services/database/json.js')
-
-const storeFile = path.join(tmpMs, 'messages.json')
+const { prepare, closeDatabase } = await import('../src/services/database/sqlite.js')
 
 const CONTENT = { conversation: 'halo dari bot' }
 
 after(() => {
-    flushAll()
+    closeDatabase()
     fs.rmSync(tmpMs, { recursive: true, force: true })
 })
 
@@ -42,15 +38,25 @@ describe('message store (F-6)', () => {
         assert.equal(getMessageForRetry({}), undefined)
     })
 
-    test('store ter-persist ke disk dan dapat dimuat ulang', async () => {
+    test('store ter-persist ke tabel dan dapat dimuat ulang', async () => {
+        resetMessageStore()
         storeOutgoingMessage({ remoteJid: '628112@s.whatsapp.net', id: 'MSG3' }, CONTENT)
-        flushAll()
 
-        const raw = JSON.parse(fs.readFileSync(storeFile, 'utf8'))
-        assert.equal(raw['MSG3'].content.conversation, 'halo dari bot')
+        const row = prepare('SELECT jid, content FROM outgoing_messages WHERE id = ?').get('MSG3')
+        assert.equal(row.jid, '628112@s.whatsapp.net')
+        assert.equal(JSON.parse(row.content).conversation, 'halo dari bot')
 
         const fresh = await import('../src/services/message-store.js?reload=1')
         assert.deepEqual(fresh.getMessageForRetry({ id: 'MSG3' }), CONTENT, 'record dimuat ulang oleh instance baru')
+    })
+
+    test('rekaman kedaluwarsa dibuang dan dihapus saat dimuat', async () => {
+        resetMessageStore()
+        prepare('INSERT INTO outgoing_messages(id, jid, content, created_at) VALUES (?, ?, ?, ?)').run('LEGACY1', '628111@s.whatsapp.net', JSON.stringify({ conversation: 'lama' }), Date.now() - 2 * 60 * 60_000)
+
+        const fresh = await import('../src/services/message-store.js?expired=1')
+        assert.equal(fresh.getMessageForRetry({ id: 'LEGACY1' }), undefined, 'rekaman kedaluwarsa tidak diteruskan')
+        assert.equal(prepare('SELECT 1 AS found FROM outgoing_messages WHERE id = ?').get('LEGACY1'), undefined, 'rekaman kedaluwarsa dihapus dari tabel')
     })
 
     test('LRU: entri terlama dibuang saat melebihi kapasitas', () => {

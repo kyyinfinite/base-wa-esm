@@ -6,19 +6,17 @@ import path from 'path'
 
 const tmpCv = fs.mkdtempSync(path.join(os.tmpdir(), 'wa-cv-'))
 process.env.WA_DATABASE_DIR = tmpCv
-process.env.WA_OWNER_PATH = path.join(tmpCv, 'owner.json')
-process.env.WA_PREMIUM_PATH = path.join(tmpCv, 'premium.json')
 process.env.WA_CONFIG_PATH = path.join(tmpCv, 'config.json')
 fs.writeFileSync(process.env.WA_CONFIG_PATH, JSON.stringify({ botMode: 'public', prefix: ['.'], dailyLimit: 5, creator: [] }))
 
 const svc = await import('../src/services/whatsapp-service.js')
 const conv = await import('../src/services/conversation-state.js')
 const sched = await import('../src/services/scheduler.js')
-const { flushAll } = await import('../src/services/database/json.js')
+const { closeDatabase } = await import('../src/services/database/sqlite.js')
 
 after(async () => {
     await sched.stopScheduler()
-    flushAll()
+    closeDatabase()
     fs.rmSync(tmpCv, { recursive: true, force: true })
 })
 
@@ -320,9 +318,7 @@ describe('scheduler pesan WhatsApp', () => {
         }
     })
 
-    test('job tersimpan di disk dan dipulihkan saat start ulang', async () => {
-        const { flushAll: flushNow } = await import('../src/services/database/json.js')
-
+    test('job tersimpan di tabel dan dipulihkan saat start ulang', async () => {
         await sched.startScheduler({ sender: async () => {} })
         sched.addScheduledJob({
             id: 'persisted',
@@ -330,7 +326,6 @@ describe('scheduler pesan WhatsApp', () => {
             content: { text: 'tetap ada' },
             at: Date.now() + 60_000
         })
-        flushNow()
         await sched.stopScheduler()
 
         const fresh = await import('../src/services/scheduler.js?restore=1')

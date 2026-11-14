@@ -10,7 +10,7 @@
     <a href="https://nodejs.org/"><img src="https://img.shields.io/badge/Node.js-%3E%3D20-339933?logo=nodedotjs&logoColor=white" alt="Node.js 20+"></a>
     <a href="https://github.com/WhiskeySockets/Baileys"><img src="https://img.shields.io/badge/Baileys-7.0.0--rc14-25D366?logo=whatsapp&logoColor=white" alt="Baileys 7.0.0-rc14"></a>
     <img src="https://img.shields.io/badge/JavaScript-ESM-F7DF1E?logo=javascript&logoColor=222" alt="JavaScript ESM">
-    <img src="https://img.shields.io/badge/Version-2.0.0-0C9B76" alt="Version 2.0.0">
+    <img src="https://img.shields.io/badge/Version-2.1.0-0C9B76" alt="Version 2.0.0">
     <a href="LICENSE"><img src="https://img.shields.io/badge/License-MIT-blue.svg" alt="MIT License"></a>
   </p>
 
@@ -264,7 +264,7 @@ Temporary state is stored by chat and state name, making multi-step interactions
 
 - One-time scheduled messages.
 - Repeating interval messages.
-- Persistent job storage in `schedules.json`.
+- Persistent job storage in the `schedules` table of `database/database.db`.
 - Job restoration after restart.
 - In-flight execution guard to prevent duplicate concurrent sends.
 - Retry handling for failed one-time messages (up to three attempts).
@@ -275,28 +275,32 @@ The current scheduler supports one-time and interval-based jobs. Calendar cron e
 
 ### 11. Database & persistence
 
-The JSON persistence layer provides local storage for runtime records.
+All persistent data lives in a single SQLite database file, `database/database.db`, managed by `better-sqlite3` with WAL journaling.
 
-**Built-in collections**
+**Tables**
 
-- `users.json`
-- `groups.json`
-- `settings.json`
-- `identity.json`
-- `messages.json`
-- `schedules.json`
+- `users` — user records, usage limits, first/last seen.
+- `access_roles` — owner and premium numbers.
+- `wa_groups` — group records and settings.
+- `settings` — runtime settings such as the daily limit reset marker.
+- `identity_map` — PN to LID mappings.
+- `outgoing_messages` — retry payloads for outgoing messages.
+- `schedules` — persistent scheduler jobs.
+- `crm_messages` / `crm_nodes` — CRM message and node storage.
+- `schema_migrations` — applied schema versions.
 
 **Persistence behavior**
 
-- In-memory collection cache.
-- Debounced writes (250 ms).
-- Atomic temporary-file-and-rename writes.
-- Dirty-state tracking.
-- Automatic write retry with bounded backoff.
-- `flushAll()` for controlled shutdown.
-- Configurable database location through `WA_DATABASE_DIR`.
+- Single-file SQLite storage with WAL journaling, `synchronous=NORMAL`, foreign keys, and a 5-second busy timeout.
+- Ordered schema migrations applied automatically at connection open; adding an entry to `src/services/database/migrations/index.js` upgrades the database on next boot.
+- Atomic single-statement usage-limit updates (`UPDATE ... WHERE remaining_limit >= ? RETURNING ...`).
+- Prepared statements cached per module.
+- Daily backup via `VACUUM INTO` into `database/backups/`, rotated according to `dbBackupKeep` (default 7).
+- `closeDatabase()` on shutdown runs `wal_checkpoint(TRUNCATE)` for a compact database file.
+- Database location through `WA_DATABASE_FILE` or `WA_DATABASE_DIR`.
+- Existing installs: on first start without a `WA_DATABASE_*` override, a database left in the old `src/database/` folder (`database.db`, `-wal`, `-shm`, `backups/`, `logs/`) is copied to `database/`, verified, and then removed from the old location; nothing is overwritten if `database/database.db` already exists.
 - Throttled `lastSeen`-only persistence.
-- Immediate persistence for operational changes such as usage-limit updates.
+- Migrating from the legacy JSON engine is covered in `docs/MIGRATION.md` (`scripts/migrate-json-to-sqlite.js`, rollback via `scripts/export-sqlite-to-json.js`).
 
 **Outgoing message store**
 
@@ -373,6 +377,20 @@ On first startup, the runtime requests the phone number used for pairing when pa
 
 After a successful connection, the plugin stack is initialized. Send `.menu` to the bot to view the generated command menu.
 
+### Instalasi di Termux (Android)
+
+`better-sqlite3` adalah native module. Di Termux, prebuilt binary tidak tersedia untuk platform Android, sehingga npm akan mengompilasi dari kode sumber saat `npm install`. Toolchain berikut harus tersedia sebelum instalasi:
+
+```bash
+pkg update && pkg upgrade
+pkg install python make clang
+npm install
+```
+
+Jika kompilasi gagal dengan error `Could not load the bindings file`, pastikan `python`, `make`, dan `clang` sudah terpasang dan jalankan ulang `npm install`.
+
+> **Catatan:** langkah Termux ini belum diverifikasi dan harus dicoba langsung oleh pemilik proyek sebelum diandalkan.
+
 ## ⚙️ Configuration
 
 The repository's current `config.json` uses the following fields:
@@ -393,6 +411,8 @@ The repository's current `config.json` uses the following fields:
   "botMode": "public",
   "dailyLimit": 10,
   "usePairingCode": true,
+  "enableShell": true,
+  "enableEval": true,
   "accessDenied": {
     "owner": "Perintah ini hanya dapat digunakan oleh owner.",
     "creator": "Perintah ini hanya dapat digunakan oleh creator.",
@@ -410,14 +430,48 @@ The repository's current `config.json` uses the following fields:
 | `botMode` | `public` or `self` |
 | `dailyLimit` | Default daily usage limit |
 | `usePairingCode` | `true` for pairing code; `false` for QR login |
+| `enableShell` | Enables the `shell` plugin (creator only) |
+| `enableEval` | Enables the `eval` plugin (creator only) |
 | `accessDenied` | Custom access-denied messages |
 
-Owner and premium records are maintained in:
+### Optional tuning keys
 
-- `src/database/owner.json`
-- `src/database/premium.json`
+All keys below are optional and fall back to defaults in code, so an older
+`config.json` keeps working:
 
-Manage them using the built-in owner commands described below.
+| Key | Default | Description |
+| --- | ---: | --- |
+| `pairingNumber` | `""` | Non-interactive pairing number (digits only); env `WA_PAIRING_NUMBER` is also honored |
+| `timezone` | `"Asia/Jakarta"` | Timezone for limit reset and cron evaluation (IANA name) |
+| `maxMessageAgeSec` | `60` | Incoming messages older than this are dropped (except own messages) |
+| `queueTaskTimeoutMs` | `120000` | Per-task queue timeout, overridable per plugin with `handler.timeoutMs` |
+| `maxConcurrentTasks` | `8` | Global semaphore limit for concurrent plugin tasks; owner/creator tasks get priority |
+| `prefixlessCommands` | `false` | Allow single-word commands without prefix globally; per-plugin opt-in with `handler.prefixless` |
+| `enableShell` | `false` | Runtime gate for the shell plugin |
+| `enableEval` | `false` | Runtime gate for the eval plugin |
+| `markOnlineOnConnect` | `false` | Bot appears online after connect |
+| `identityMaxStored` | `20000` | Maximum entries kept in the `identity_map` table |
+| `outboundMinIntervalMs` | `400` | Minimum interval between outbound sends per chat |
+| `outboundMaxRetries` | `3` | Retry attempts for rate-limit errors (429 / rate-overlimit) |
+| `schedulerMisfireGraceMs` | `300000` | Misfire grace for scheduler jobs; late one-shot jobs run once then are removed |
+| `hotReload` | `true` outside production | Enables plugin directory watchers |
+| `logToFile` | `false` | Writes structured logs to `database/logs/bot.log` with size rotation (5 MB, 3 files) |
+| `dbBackupKeep` | `7` | Number of daily `VACUUM INTO` backups kept in `database/backups/` |
+| `shutdownTimeoutMs` | `10000` | Shutdown deadline; a hanging socket close forces exit |
+
+> `hotReload` defaults to `true` when `NODE_ENV` is not `production`.
+
+Owner and premium records are maintained in the `access_roles` table of `database/database.db` and managed through the built-in owner commands described below.
+
+### Environment variables
+
+| Variable | Purpose |
+| --- | --- |
+| `WA_DATABASE_FILE` | Absolute path of the SQLite database file; takes precedence over `WA_DATABASE_DIR` |
+| `WA_DATABASE_DIR` | Directory that holds `database.db` (default `database`); also used by tests to point at a temporary directory |
+| `WA_CONFIG_PATH` | Path of `config.json` (default `<repo>/config.json`) |
+| `WA_LOG_DIR` | Directory for rotated log files (default `database/logs`) |
+| `WA_PAIRING_NUMBER` | Non-interactive pairing number when `config.pairingNumber` is empty |
 
 ## 🧩 Plugin development
 
@@ -550,22 +604,31 @@ export default handler
 
 ## 🧰 Built-in plugins
 
-The repository currently includes **10 plugins**:
+The repository currently includes **17 plugins**:
 
 | Category | Plugin | Purpose |
 | --- | --- | --- |
 | General | `menu.js` | Generated command menu |
+| General | `memory.js` | Memory usage snapshot |
 | General | `sc.js` | Source-code information/link |
+| Maker | `brat.js` | Text-to-image sticker generator |
+| Maker | `bratvid.js` | Animated brat sticker generator |
+| Maker | `sticker.js` | Media-to-sticker converter |
 | Owner | `addowner.js` | Add an owner |
-| Owner | `delowner.js` | Remove an owner |
 | Owner | `addprem.js` | Add a premium user |
+| Owner | `crm.js` | Conversation memory for CRM flows |
+| Owner | `delowner.js` | Remove an owner |
 | Owner | `delprem.js` | Remove a premium user |
 | Owner | `public.js` | Switch to public mode |
 | Owner | `self.js` | Switch to self mode |
+| Owner | `status.js` | Runtime diagnostic report and command metrics |
 | Shell | `eval.js` | Execute JavaScript expressions |
 | Shell | `shell.js` | Execute system shell commands |
+| Tools | `upload.js` | Upload media to a temporary host |
 
-> **Security:** `eval` and `shell` are highly privileged capabilities. They can execute arbitrary code or operating-system commands. Keep them restricted to trusted owners, and remove or disable them if they are not required.
+> **Security:** `eval` and `shell` are highly privileged capabilities gated by
+> `config.enableShell` / `config.enableEval` and reserved for the creator.
+> Remove or disable them if they are not required.
 
 ## 🗂 Project structure
 
@@ -576,39 +639,61 @@ base-wa-esm/
 ├── package.json
 ├── package-lock.json
 │
+├── database/                # SQLite database.db, backups/, logs/ (created at runtime)
+│
 ├── plugins/
 │   ├── general/
+│   ├── maker/
 │   ├── owner/
-│   └── shell/
+│   ├── shell/
+│   └── tools/
+│
+├── scripts/
+│   ├── check-no-comments.js   # Comment policy checker
+│   ├── check-syntax.js        # node --check helper
+│   ├── migrate-json-to-sqlite.js  # One-off JSON to SQLite migration
+│   ├── export-sqlite-to-json.js  # Rollback export back to JSON
+│   └── smoke-database.js     # Core-operation smoke test
+│
+├── docs/
+│   └── MIGRATION.md          # JSON to SQLite runbook
+│
+├── .github/workflows/ci.yml   # CI: test, comment check, audit (Node 20/22)
 │
 ├── src/
 │   ├── core/
-│   │   ├── app/             # Socket lifecycle and reconnect
+│   │   ├── app/             # connect facade, transport, listeners, auth store
 │   │   ├── context/         # Plugin execution context
 │   │   ├── dispatcher/      # Message and command dispatch
 │   │   ├── errors/          # Centralized error reporting
 │   │   ├── events/          # Internal event engine
+│   │   ├── ingest/          # Upsert filters (type, jid, message age)
 │   │   ├── message/         # Message normalization
 │   │   ├── middleware/      # Access and execution middleware
-│   │   ├── plugin/          # Plugin loader and registry
-│   │   ├── queue/           # Per-chat queue and deduplication
+│   │   ├── outbound/        # Outbound queue (throttle + retry) and singleton
+│   │   ├── plugin/          # Plugin loader, registry, lifecycle
+│   │   ├── queue/           # Per-chat queue, deduplication, semaphore
 │   │   └── scheduler/       # Daily limit reset
 │   │
-│   ├── database/            # Runtime JSON records
 │   ├── lib/
+│   │   ├── crm/             # CRM store (isolated subsystem)
+│   │   ├── image/           # EXIF handling
 │   │   └── message/         # Interactive message builders
 │   ├── services/
-│   │   ├── database/        # JSON persistence services
+│   │   ├── database/        # SQLite persistence (connection, migrations, users, groups, settings)
 │   │   ├── help/            # Help data engine
 │   │   ├── access.js        # Owner and premium access
+│   │   ├── code-runner.js    # Sandboxed code execution
 │   │   ├── config.js        # Configuration service
 │   │   ├── conversation-state.js
+│   │   ├── cron.js          # 5-field cron parser with timezone
 │   │   ├── group-cache.js
 │   │   ├── health.js
 │   │   ├── identity-resolver.js
 │   │   ├── logger.js
 │   │   ├── menu-engine.js
 │   │   ├── message-store.js
+│   │   ├── metrics.js       # Per-command and global metrics
 │   │   ├── scheduler.js
 │   │   └── whatsapp-service.js
 │   └── utils/               # JID, identity, and common helpers
@@ -633,18 +718,18 @@ npm run check
 
 ### Recorded verification
 
-The implementation manifest (`MANIFEST_PHASE1-9.md`) records the Phase 9 verification results:
+Release 2.0 reworked the core engine (phases 0-6): ingest filters and message
+age limits, a dispatcher pipeline that never blocks on slow plugins, a queue
+with per-task timeouts and a global concurrency semaphore, PN/LID identity and
+admin matching, an outbound layer with per-chat throttle and rate-limit retry,
+an event bridge (`wa:*`, `bot:ready`, `bot:disconnect`), a scheduler with
+misfire handling and 5-field cron expressions, plugin lifecycle hooks
+(`init`, `dispose`, `before`, `after`, `handler.on`, `category`), file-level
+durability (`.bak` recovery and quarantine for corrupt files), and observability
+(metrics, optional JSON log files, `status` command, bounded shutdown).
 
-| Check | Recorded result |
-| --- | ---: |
-| Test suites | 58 |
-| Tests | 353 |
-| Passed | 353 |
-| Failed | 0 |
-| JavaScript syntax check | Passed |
-| npm audit vulnerabilities | 0 |
-
-These are the results recorded in the supplied implementation manifest, not a claim that the tests were freshly executed when this README was generated. Run the commands above against your current checkout to verify its state.
+The historical manifest file referenced by earlier versions has been removed;
+run the commands above against your current checkout to verify its state.
 
 ## 🔐 Security notes
 
@@ -673,3 +758,14 @@ This project declares the **MIT License** in `package.json`. See the repository'
   <sub>Built with JavaScript ESM and Baileys.</sub>
 
 </div>
+
+
+## CRMStore Integration
+
+CRMStore v1-b is integrated as an additional persistence layer at `src/lib/crm/`. Storage rides the single SQLite database file `database/database.db` (`better-sqlite3`, WAL journaling) with message payloads stored as BLOBs and nodes serialized as JSON text in the `crm_messages` and `crm_nodes` tables; the existing Base WA ESM message store remains independent. The database location follows `WA_DATABASE_FILE` / `WA_DATABASE_DIR` (`database/` by default). Retention is seven days with hourly cleanup batches, optional `MESSAGE_CACHE_LIMIT` trimming, orphan-node removal, and `incremental_vacuum` maintenance. The CRM owner commands are available through the existing recursive plugin loader: `crm`, `crm2`, `insp`, `adn`, `relay`, and `lastchat`.
+
+```bash
+npm install
+```
+
+CRMStore is bound automatically whenever a new Baileys socket is created, including reconnect sessions.

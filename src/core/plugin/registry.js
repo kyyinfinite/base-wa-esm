@@ -23,7 +23,13 @@ const ALLOWED_META_TYPES = {
     limit: 'numberOrTrue',
     customPrefix: 'regexp',
     before: 'function',
-    after: 'function'
+    after: 'function',
+    prefixless: 'boolean',
+    timeoutMs: 'number',
+    init: 'function',
+    dispose: 'function',
+    category: 'string',
+    on: 'eventMap'
 }
 
 function toCommandList(command) {
@@ -69,6 +75,7 @@ export function validatePlugin(handler) {
             kind === 'number' ? typeof value === 'number' && Number.isFinite(value) && value >= 0 :
             kind === 'numberOrTrue' ? value === true || (typeof value === 'number' && Number.isFinite(value) && value >= 0) :
             kind === 'regexp' ? value instanceof RegExp :
+            kind === 'eventMap' ? (value && typeof value === 'object' && !Array.isArray(value) && Object.values(value).every(fn => typeof fn === 'function')) :
             kind === 'function' ? typeof value === 'function' : false
 
         if (!valid) {
@@ -93,7 +100,13 @@ function buildMetadata(handler, commands) {
         admin: !!handler.admin,
         botAdmin: !!handler.botAdmin,
         cooldown: handler.cooldown || 0,
-        limit: handler.limit || 0
+        limit: handler.limit || 0,
+        prefixless: !!handler.prefixless,
+        timeoutMs: Number.isFinite(Number(handler.timeoutMs)) ? Number(handler.timeoutMs) : 0,
+        category: handler.category || '',
+        hasInit: typeof handler.init === 'function',
+        hasDispose: typeof handler.dispose === 'function',
+        hasEvents: !!(handler.on && typeof handler.on === 'object')
     }
 }
 

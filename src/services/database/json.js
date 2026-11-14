@@ -9,6 +9,7 @@ const dirty = new Set()
 const writeFailures = new Map()
 
 let flushTimer = null
+const compactNames = new Set()
 
 const FLUSH_DELAY_MS = 250
 const RETRY_DELAY_MAX_MS = 30000
@@ -39,7 +40,7 @@ const read = (name, fallback = {}) => {
 const writeSync = (name, data) => {
     const file = ensureFile(name)
     const temp = `${file}.tmp`
-    fs.writeFileSync(temp, JSON.stringify(data, null, 2))
+    fs.writeFileSync(temp, compactNames.has(name) ? JSON.stringify(data) : JSON.stringify(data, null, 2))
     fs.renameSync(temp, file)
     cache.set(name, data)
     dirty.delete(name)
@@ -87,32 +88,38 @@ export async function flushDirty() {
     flushNow()
 }
 
-const collection = name => ({
-    all: () => read(name, {}),
-    get: id => read(name, {})[id] || null,
-    set: (id, value) => {
-        const data = read(name, {})
-        data[id] = value
-        return write(name, data)
-    },
-    touch: (id, patch) => {
-        const data = read(name, {})
-        data[id] = { ...(data[id] || {}), ...patch }
-        write(name, data)
-        return data[id]
-    },
-    patchMemory: (id, patch) => {
-        const data = read(name, {})
-        data[id] = { ...(data[id] || {}), ...patch }
-        return data[id]
-    },
-    setAll: data => write(name, data),
-    delete: id => {
-        const data = read(name, {})
-        delete data[id]
-        return write(name, data)
+const collection = (name, options = {}) => {
+    if (options.compact) compactNames.add(name)
+
+    return {
+        all: () => read(name, {}),
+        get: id => read(name, {})[id] || null,
+        set: (id, value) => {
+            const data = read(name, {})
+            data[id] = value
+            return write(name, data)
+        },
+        touch: (id, patch) => {
+            const data = read(name, {})
+            data[id] = { ...(data[id] || {}), ...patch }
+            write(name, data)
+            return data[id]
+        },
+        patchMemory: (id, patch) => {
+            const data = read(name, {})
+            data[id] = { ...(data[id] || {}), ...patch }
+            return data[id]
+        },
+        setAll: data => write(name, data),
+        delete: id => {
+            const data = read(name, {})
+            delete data[id]
+            return write(name, data)
+        }
     }
-})
+}
+
+export const databaseFilePath = name => path.join(databaseDir, name)
 
 export const flushAll = () => {
     if (flushTimer) {
@@ -128,5 +135,8 @@ export const settings = collection('settings.json')
 export const identityMappings = collection('identity.json')
 export const outgoingMessages = collection('messages.json')
 export const schedules = collection('schedules.json')
-export const jsonDatabase = { users, groups, settings, identityMappings, outgoingMessages, schedules }
+export const crmMessages = collection('crm-messages.json', { compact: true })
+export const crmNodes = collection('crm-nodes.json', { compact: true })
+export const crmMeta = collection('crm-meta.json')
+export const jsonDatabase = { users, groups, settings, identityMappings, outgoingMessages, schedules, crmMessages, crmNodes, crmMeta }
 export default jsonDatabase

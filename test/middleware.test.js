@@ -6,15 +6,13 @@ import path from 'path'
 
 const tmpMid = fs.mkdtempSync(path.join(os.tmpdir(), 'wa-mid-'))
 process.env.WA_DATABASE_DIR = tmpMid
-process.env.WA_OWNER_PATH = path.join(tmpMid, 'owner.json')
-process.env.WA_PREMIUM_PATH = path.join(tmpMid, 'premium.json')
 process.env.WA_CONFIG_PATH = path.join(tmpMid, 'config.json')
 fs.writeFileSync(process.env.WA_CONFIG_PATH, JSON.stringify({ dailyLimit: 5, botMode: 'public', prefix: ['.'], accessDenied: { owner: 'Khusus owner.' } }))
 
 const { runMiddleware, useMiddleware, getMiddlewares } = await import('../src/core/middleware/engine.js')
 const { clearCooldowns, checkCooldown, commitCooldown, releaseCooldown, getCooldownKey } = await import('../src/core/middleware/cooldown.js')
-const { upsertUser, getUser } = await import('../src/services/database/users.js')
-const { flushAll } = await import('../src/services/database/json.js')
+const { upsertUser, getUser, consumeUserLimit } = await import('../src/services/database/users.js')
+const { closeDatabase } = await import('../src/services/database/sqlite.js')
 
 const makeCtx = (overrides = {}) => {
     const sent = []
@@ -48,7 +46,7 @@ const makeHandler = (meta = {}) => {
 }
 
 after(() => {
-    flushAll()
+    closeDatabase()
     fs.rmSync(tmpMid, { recursive: true, force: true })
 })
 
@@ -256,10 +254,8 @@ describe('middleware engine', () => {
     })
 
     test('reserve atomik: dua eksekusi paralel chat berbeda dengan limit 1 hanya satu lolos', async () => {
-        const { users } = await import('../src/services/database/json.js')
-        const record = upsertUser({ jid: '628103@s.whatsapp.net', name: 'Racer' })
-        record.limit = 1
-        users.set('628103', record)
+        upsertUser({ jid: '628103@s.whatsapp.net', name: 'Racer' })
+        consumeUserLimit('628103@s.whatsapp.net', 4)
 
         const makeRacer = () => makeCtx({
             m: { chat: '628103@s.whatsapp.net', userJid: '628103@s.whatsapp.net', key: { remoteJid: '628103@s.whatsapp.net' } },

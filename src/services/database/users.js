@@ -1,9 +1,24 @@
-import { users } from './json.js'
+import { prepare } from './sqlite.js'
 import { toUserJid, toNumber, toLidJid } from '../../utils/identity.js'
 import { peekPNForLID } from '../identity-resolver.js'
 import { getDailyLimit } from '../config.js'
 
 const now = () => new Date().toISOString()
+const toEpoch = iso => Date.parse(iso)
+
+const SELECT_COLUMNS = 'jid, name, first_seen, last_seen, remaining_limit'
+
+function toRecord(row) {
+    if (!row) return null
+
+    return {
+        jid: row.jid,
+        name: row.name,
+        firstSeen: new Date(row.first_seen).toISOString(),
+        lastSeen: new Date(row.last_seen).toISOString(),
+        limit: row.remaining_limit
+    }
+}
 
 const LASTSEEN_PERSIST_MS = 60_000
 const LASTSEEN_TRACK_MAX = 5000
@@ -36,7 +51,10 @@ export function getUserKey(jid) {
 
 export function getUser(jid) {
     const key = getUserKey(jid)
-    return key ? users.get(key) : null
+    if (!key) return null
+
+    const row = prepare(`SELECT ${SELECT_COLUMNS} FROM users WHERE key = ?`).get(key)
+    return toRecord(row)
 }
 
 export function upsertUser({ jid, name = '', isPremium = false, isOwner = false, isCreator = false } = {}) {
@@ -44,38 +62,33 @@ export function upsertUser({ jid, name = '', isPremium = false, isOwner = false,
     const key = getUserKey(canonicalJid)
     if (!key) return null
 
-    const existing = users.get(key)
+    const existing = prepare(`SELECT ${SELECT_COLUMNS} FROM users WHERE key = ?`).get(key)
     const timestamp = now()
     const record = {
         jid: canonicalJid,
         name: String(name || existing?.name || ''),
-        firstSeen: existing?.firstSeen || timestamp,
+        firstSeen: existing ? new Date(existing.first_seen).toISOString() : timestamp,
         lastSeen: timestamp,
-        limit: Number.isFinite(existing?.limit) ? existing.limit : getDailyLimit(),
-        premium: !!(isPremium || existing?.premium),
-        owner: !!(isOwner || existing?.owner),
-        creator: !!(isCreator || existing?.creator)
+        limit: Number.isFinite(existing?.remaining_limit) ? existing.remaining_limit : getDailyLimit(),
+        premium: !!isPremium,
+        owner: !!isOwner,
+        creator: !!isCreator
     }
 
     const isNew = !existing
     const fieldsChanged = !isNew && (
         record.name !== existing.name ||
-        record.limit !== existing.limit ||
-        record.premium !== existing.premium ||
-        record.owner !== existing.owner ||
-        record.creator !== existing.creator
+        record.limit !== existing.remaining_limit
     )
 
     if (isNew || fieldsChanged) {
-        users.set(key, record)
+        prepare('INSERT INTO users(key, jid, name, first_seen, last_seen, remaining_limit) VALUES (?, ?, ?, ?, ?, ?) ON CONFLICT(key) DO UPDATE SET jid = excluded.jid, name = excluded.name, last_seen = excluded.last_seen, remaining_limit = excluded.remaining_limit').run(key, record.jid, record.name, toEpoch(record.firstSeen), toEpoch(record.lastSeen), record.limit)
     } else {
         const last = lastSeenPersistAt.get(key) || 0
         if (Date.now() - last >= LASTSEEN_PERSIST_MS) {
             lastSeenPersistAt.set(key, Date.now())
             pruneLastSeenTracking()
-            users.touch(key, { lastSeen: record.lastSeen })
-        } else {
-            users.patchMemory(key, { lastSeen: record.lastSeen })
+            prepare('UPDATE users SET last_seen = ? WHERE key = ?').run(toEpoch(record.lastSeen), key)
         }
     }
 
@@ -86,49 +99,29 @@ export function consumeUserLimit(jid, cost = 1) {
     const key = getUserKey(jid)
     if (!key) return null
 
-    const existing = users.get(key)
-    if (!existing) return null
-
-    const current = Number.isFinite(existing.limit) ? existing.limit : 0
-    const record = { ...existing, limit: Math.max(0, current - cost), lastSeen: now() }
-    users.set(key, record)
-    return record
+    const row = prepare('UPDATE users SET remaining_limit = MAX(remaining_limit - ?, 0), last_seen = ? WHERE key = ? RETURNING jid, name, first_seen, last_seen, remaining_limit').get(cost, Date.now(), key)
+    return toRecord(row)
 }
 
 export function tryConsumeUserLimit(jid, cost = 1) {
     const key = getUserKey(jid)
     if (!key) return null
 
-    const existing = users.get(key)
-    if (!existing) return null
+    const row = prepare('UPDATE users SET remaining_limit = remaining_limit - ?, last_seen = ? WHERE key = ? AND remaining_limit >= ? RETURNING jid, name, first_seen, last_seen, remaining_limit').get(cost, Date.now(), key, cost)
+    if (row) return toRecord(row)
 
-    const current = Number.isFinite(existing.limit) ? existing.limit : 0
-    if (current < cost) return false
-
-    const record = { ...existing, limit: current - cost, lastSeen: now() }
-    users.set(key, record)
-    return record
+    const exists = prepare('SELECT 1 AS found FROM users WHERE key = ?').get(key)
+    return exists ? false : null
 }
 
 export function refundUserLimit(jid, cost = 1) {
     const key = getUserKey(jid)
     if (!key) return null
 
-    const existing = users.get(key)
-    if (!existing) return null
-
-    const current = Number.isFinite(existing.limit) ? existing.limit : 0
-    const record = { ...existing, limit: current + cost, lastSeen: now() }
-    users.set(key, record)
-    return record
+    const row = prepare('UPDATE users SET remaining_limit = remaining_limit + ?, last_seen = ? WHERE key = ? RETURNING jid, name, first_seen, last_seen, remaining_limit').get(cost, Date.now(), key)
+    return toRecord(row)
 }
 
 export function resetAllUserLimits(defaultLimit) {
-    const all = users.all()
-    const keys = Object.keys(all)
-    for (const key of keys) {
-        all[key] = { ...all[key], limit: defaultLimit }
-    }
-    if (keys.length > 0) users.setAll(all)
-    return keys.length
+    return prepare('UPDATE users SET remaining_limit = ?').run(defaultLimit).changes
 }

@@ -1,6 +1,7 @@
-import { groups } from './json.js'
+import { prepare } from './sqlite.js'
 
 const now = () => new Date().toISOString()
+const toEpoch = iso => Date.parse(iso)
 
 export function getGroupKey(jid) {
     const value = String(jid || '').trim()
@@ -9,14 +10,30 @@ export function getGroupKey(jid) {
 
 export function getGroup(jid) {
     const key = getGroupKey(jid)
-    return key ? groups.get(key) : null
+    if (!key) return null
+
+    const row = prepare('SELECT jid, name, created_at, settings FROM wa_groups WHERE jid = ?').get(key)
+    if (!row) return null
+
+    let settings = {}
+    try {
+        const parsed = JSON.parse(row.settings)
+        if (parsed && typeof parsed === 'object') settings = parsed
+    } catch {}
+
+    return {
+        jid: row.jid,
+        name: row.name,
+        createdAt: new Date(row.created_at).toISOString(),
+        settings
+    }
 }
 
 export function upsertGroup({ jid, name = '', settings } = {}) {
     const key = getGroupKey(jid)
     if (!key) return null
 
-    const existing = groups.get(key)
+    const existing = getGroup(key)
     const record = {
         jid: key,
         name: String(name || existing?.name || ''),
@@ -31,6 +48,9 @@ export function upsertGroup({ jid, name = '', settings } = {}) {
         record.name !== existing.name ||
         JSON.stringify(record.settings) !== JSON.stringify(existing.settings)
 
-    if (changed) groups.set(key, record)
+    if (changed) {
+        prepare('INSERT INTO wa_groups(jid, name, created_at, settings) VALUES (?, ?, ?, ?) ON CONFLICT(jid) DO UPDATE SET name = excluded.name, settings = excluded.settings').run(key, record.name, toEpoch(record.createdAt), JSON.stringify(record.settings))
+    }
+
     return record
 }

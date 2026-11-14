@@ -6,7 +6,9 @@ const CATEGORY_MAP = {
     game: { id: 'game', title: 'Game', description: 'Permainan dan hiburan' },
     snippet: { id: 'snippet', title: 'Snippet', description: 'Simpan dan berbagi kode' },
     owner: { id: 'owner', title: 'Owner', description: 'Pengelolaan bot dan akses owner' },
-    shell: { id: 'system', title: 'System', description: 'Tools sistem dan internal' }
+    shell: { id: 'system', title: 'System', description: 'Tools sistem dan internal' },
+    maker: { id: 'maker', title: 'Maker', description: 'Pembuatan sticker dan media' },
+    tools: { id: 'tools', title: 'Tools', description: 'Alat bantu dan utilitas' }
 }
 
 function folderOf(file) {
@@ -37,6 +39,12 @@ function allowed(meta, ctx) {
     return true
 }
 
+function categoryKeyOf(meta, file) {
+    if (meta.category) return meta.category
+    if (Array.isArray(meta.tags) && meta.tags.length) return meta.tags[0]
+    return folderOf(file)
+}
+
 export function getMenuData(ctx = {}) {
     const groups = new Map()
 
@@ -44,7 +52,8 @@ export function getMenuData(ctx = {}) {
         if (!allowed(meta, ctx)) continue
 
         const folder = folderOf(file)
-        const info = CATEGORY_MAP[folder] || CATEGORY_MAP.general
+        const categoryKey = categoryKeyOf(meta, file)
+        const info = CATEGORY_MAP[categoryKey] || CATEGORY_MAP[folder] || CATEGORY_MAP.general
         if (!groups.has(info.id)) groups.set(info.id, { ...info, commands: [] })
 
         const commands = Array.isArray(meta.commands) ? meta.commands.filter(Boolean) : []

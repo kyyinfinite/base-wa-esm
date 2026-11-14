@@ -11,186 +11,21 @@ fs.writeFileSync(tmpConfig, JSON.stringify({ dailyLimit: 7, botMode: 'public', p
 process.env.WA_DATABASE_DIR = tmpDb
 process.env.WA_CONFIG_PATH = tmpConfig
 
-const db = await import('../src/services/database/json.js')
-const { users, groups, settings, identityMappings, flushAll, flushDirty } = db
-const { getUserKey, getUser, upsertUser, consumeUserLimit, resetAllUserLimits } = await import('../src/services/database/users.js')
+const { prepare, closeDatabase, getDatabase, resetDatabaseForTests } = await import('../src/services/database/sqlite.js')
+const { getUserKey, getUser, upsertUser, consumeUserLimit, tryConsumeUserLimit, refundUserLimit, resetAllUserLimits } = await import('../src/services/database/users.js')
 const { getGroup, getGroupKey, upsertGroup } = await import('../src/services/database/groups.js')
+const { getSetting, setSetting } = await import('../src/services/database/settings.js')
 const { getDailyLimit, updateConfig, getConfig } = await import('../src/services/config.js')
+const limitReset = await import('../src/core/scheduler/limitReset.js')
 
-const usersFile = path.join(tmpDb, 'users.json')
-const settingsFile = path.join(tmpDb, 'settings.json')
-
-const readJson = file => JSON.parse(fs.readFileSync(file, 'utf8'))
+const dbFile = path.join(tmpDb, 'database.db')
 
 after(() => {
-    flushAll()
+    closeDatabase()
     fs.rmSync(tmpDb, { recursive: true, force: true })
 })
 
-describe('json database', () => {
-    test('collection set/get/touch/delete bekerja', () => {
-        settings.set('k1', { a: 1 })
-        assert.deepEqual(settings.get('k1'), { a: 1 })
-
-        settings.touch('k1', { b: 2 })
-        assert.deepEqual(settings.get('k1'), { a: 1, b: 2 })
-
-        settings.delete('k1')
-        assert.equal(settings.get('k1'), null)
-    })
-
-    test('set ter-persist setelah flush deterministik', async () => {
-        users.set('persist-user', { limit: 5 })
-        await flushDirty()
-
-        assert.equal(readJson(usersFile)['persist-user'].limit, 5)
-        users.delete('persist-user')
-        await flushDirty()
-    })
-
-    test('touch ter-persist lewat mekanisme yang sama dengan set', async () => {
-        users.set('touch-user', { limit: 5 })
-        await flushDirty()
-
-        users.touch('touch-user', { lastSeen: 'now' })
-        await flushDirty()
-
-        const raw = readJson(usersFile)['touch-user']
-        assert.equal(raw.limit, 5)
-        assert.equal(raw.lastSeen, 'now')
-
-        users.touch('touch-user', { lastSeen: 'later' })
-        await flushDirty()
-        assert.equal(readJson(usersFile)['touch-user'].lastSeen, 'later')
-
-        users.delete('touch-user')
-        await flushDirty()
-    })
-
-    test('touch tanpa set sebelumnya juga ter-persist', async () => {
-        settings.touch('touch-only', { seen: 1 })
-        await flushDirty()
-
-        assert.equal(readJson(settingsFile)['touch-only'].seen, 1)
-        settings.delete('touch-only')
-        await flushDirty()
-    })
-
-    test('delete ter-persist setelah flush', async () => {
-        users.set('del-user', { limit: 1 })
-        await flushDirty()
-        assert.ok(readJson(usersFile)['del-user'])
-
-        users.delete('del-user')
-        await flushDirty()
-        assert.equal(readJson(usersFile)['del-user'], undefined)
-    })
-
-    test('flushAll menuliskan seluruh perubahan tertunda', () => {
-        users.set('flush-user', { limit: 5 })
-        flushAll()
-        assert.equal(readJson(usersFile)['flush-user'].limit, 5)
-        users.delete('flush-user')
-        flushAll()
-    })
-
-    test('gagal tulis mempertahankan dirty state untuk retry', async () => {
-        const originalWrite = fs.writeFileSync
-        let failures = 0
-
-        users.set('retry-user', { limit: 9 })
-
-        fs.writeFileSync = () => {
-            failures += 1
-            throw new Error('disk penuh')
-        }
-
-        await flushDirty()
-        assert.ok(failures >= 1, 'writeSync harus gagal')
-        assert.equal(readJson(usersFile)['retry-user'], undefined, 'file belum berubah')
-
-        fs.writeFileSync = originalWrite
-        await flushDirty()
-
-        assert.equal(readJson(usersFile)['retry-user'].limit, 9)
-        users.delete('retry-user')
-        await flushDirty()
-    })
-
-    test('perubahan berdekatan tidak hilang saat flush', async () => {
-        users.set('burst-a', { n: 1 })
-        users.set('burst-b', { n: 2 })
-        users.touch('burst-a', { extra: true })
-        users.delete('burst-b')
-        await flushDirty()
-
-        const raw = readJson(usersFile)
-        assert.equal(raw['burst-a'].n, 1)
-        assert.equal(raw['burst-a'].extra, true)
-        assert.equal(raw['burst-b'], undefined)
-
-        users.delete('burst-a')
-        await flushDirty()
-    })
-
-    test('update bersamaan tidak saling menimpa', async () => {
-        users.set('conc-user', { hits: 0 })
-
-        const bumps = Array.from({ length: 10 }, (_, i) =>
-            new Promise(resolve => setTimeout(() => {
-                const current = users.get('conc-user') || { hits: 0 }
-                users.set('conc-user', { hits: current.hits + 1, tag: i })
-                resolve()
-            }, i))
-        )
-
-        await Promise.all(bumps)
-        await flushDirty()
-
-        const raw = readJson(usersFile)['conc-user']
-        assert.equal(raw.hits, 10, 'semua increment harus tercatat')
-        users.delete('conc-user')
-        await flushDirty()
-    })
-
-    test('flushDirty bersamaan tidak menulis ganda atau bentrok', async () => {
-        users.set('par-user', { n: 1 })
-
-        const flushes = await Promise.all([
-            flushDirty(),
-            flushDirty(),
-            flushDirty()
-        ])
-
-        assert.equal(users.get('par-user').n, 1)
-        assert.equal(readJson(usersFile)['par-user'].n, 1)
-
-        users.delete('par-user')
-        await flushDirty()
-    })
-
-    test('shutdown flush menyimpan data touch terakhir', () => {
-        settings.set('shutdown-key', { a: 1 })
-        settings.touch('shutdown-key', { final: true })
-        flushAll()
-
-        const raw = readJson(settingsFile)['shutdown-key']
-        assert.equal(raw.a, 1)
-        assert.equal(raw.final, true)
-
-        settings.delete('shutdown-key')
-        flushAll()
-    })
-
-    test('flushAll kedua setelah data bersih tidak menulis apa pun', () => {
-        flushAll()
-        const before = fs.statSync(settingsFile).mtimeMs
-        flushAll()
-        assert.equal(fs.statSync(settingsFile).mtimeMs, before)
-    })
-})
-
-describe('user database', () => {
+describe('user database sql', () => {
     test('getUserKey menolak JID non-personal', () => {
         assert.equal(getUserKey('123456@g.us'), null)
         assert.equal(getUserKey('status@broadcast'), null)
@@ -211,12 +46,14 @@ describe('user database', () => {
         assert.equal(record.limit, 7)
         assert.equal(record.name, 'Andi')
         assert.equal(record.premium, false)
+        assert.equal(record.owner, false)
+        assert.equal(record.creator, false)
+        assert.equal(record.firstSeen, record.lastSeen)
     })
 
     test('upsertUser menjaga firstSeen dan limit yang sudah ada', () => {
         const first = upsertUser({ jid: '628112@s.whatsapp.net', name: 'Budi' })
-        first.limit = 3
-        users.set(getUserKey('628112@s.whatsapp.net'), first)
+        consumeUserLimit('628112@s.whatsapp.net', 4)
 
         const second = upsertUser({ jid: '628112@s.whatsapp.net', name: 'Budi' })
         assert.equal(second.firstSeen, first.firstSeen)
@@ -234,6 +71,16 @@ describe('user database', () => {
         assert.equal(getUser('987654321098765@lid').name, 'Lid User')
     })
 
+    test('flag premium owner creator dikembalikan tanpa disimpan', () => {
+        upsertUser({ jid: '628114@s.whatsapp.net', name: 'Flag', isPremium: true, isOwner: true })
+
+        const row = prepare('SELECT key, jid, name, first_seen, last_seen, remaining_limit FROM users WHERE key = ?').get('628114')
+        assert.deepEqual(Object.keys(row).sort(), ['first_seen', 'jid', 'key', 'last_seen', 'name', 'remaining_limit'], 'kolom flag tidak ada di tabel')
+
+        const stored = getUser('628114@s.whatsapp.net')
+        assert.deepEqual(Object.keys(stored).sort(), ['firstSeen', 'jid', 'lastSeen', 'limit', 'name'], 'getUser tidak memuat flag')
+    })
+
     test('consumeUserLimit mengurangi limit tanpa negatif', () => {
         upsertUser({ jid: '628113@s.whatsapp.net', name: 'Cici' })
         const after1 = consumeUserLimit('628113@s.whatsapp.net', 2)
@@ -247,42 +94,89 @@ describe('user database', () => {
         assert.equal(consumeUserLimit('628999@s.whatsapp.net', 1), null)
     })
 
-    test('resetAllUserLimits mengembalikan semua limit', () => {
+    test('tryConsumeUserLimit atomik dan menolak saat saldo kurang', () => {
+        upsertUser({ jid: '628115@s.whatsapp.net', name: 'Atom' })
+        assert.equal(tryConsumeUserLimit('628115@s.whatsapp.net', 5).limit, 2)
+        assert.equal(tryConsumeUserLimit('628115@s.whatsapp.net', 3), false, 'limit kurang mengembalikan false')
+        assert.equal(getUser('628115@s.whatsapp.net').limit, 2, 'saldo tidak berubah saat ditolak')
+        assert.equal(tryConsumeUserLimit('628998@s.whatsapp.net', 1), null, 'user tidak ada mengembalikan null')
+    })
+
+    test('reserve atomik: dua tryConsume paralel dengan limit 1 hanya satu lolos', () => {
+        upsertUser({ jid: '628116@s.whatsapp.net', name: 'Race' })
+        consumeUserLimit('628116@s.whatsapp.net', 6)
+
+        const results = []
+        for (let i = 0; i < 2; i++) {
+            results.push(tryConsumeUserLimit('628116@s.whatsapp.net', 1))
+        }
+
+        assert.equal(results.filter(r => r !== null && r !== false).length, 1, 'hanya satu reserve berhasil')
+        assert.equal(getUser('628116@s.whatsapp.net').limit, 0, 'saldo tidak minus')
+    })
+
+    test('refundUserLimit mengembalikan saldo', () => {
+        upsertUser({ jid: '628117@s.whatsapp.net', name: 'Refund' })
+        consumeUserLimit('628117@s.whatsapp.net', 3)
+        assert.equal(refundUserLimit('628117@s.whatsapp.net', 2).limit, 6)
+        assert.equal(refundUserLimit('628997@s.whatsapp.net', 1), null)
+    })
+
+    test('resetAllUserLimits satu UPDATE dan mengembalikan jumlah baris', () => {
         const count = resetAllUserLimits(7)
-        assert.ok(count >= 3)
+        assert.ok(count >= 6)
         assert.equal(getUser('628113@s.whatsapp.net').limit, 7)
+        assert.equal(getUser('628116@s.whatsapp.net').limit, 7)
+    })
+
+    test('data bertahan setelah close dan buka ulang', () => {
+        upsertUser({ jid: '628119@s.whatsapp.net', name: 'Persist' })
+        consumeUserLimit('628119@s.whatsapp.net', 1)
+
+        closeDatabase()
+        getDatabase()
+
+        const stored = getUser('628119@s.whatsapp.net')
+        assert.equal(stored.name, 'Persist')
+        assert.equal(stored.limit, 6)
+    })
+
+    test('waktu user disimpan epoch ms dan dikembalikan sebagai ISO', () => {
+        upsertUser({ jid: '628120@s.whatsapp.net', name: 'Waktu' })
+
+        const row = prepare('SELECT first_seen, last_seen FROM users WHERE key = ?').get('628120')
+        assert.ok(Number.isInteger(row.first_seen) && row.first_seen > 1_600_000_000_000, 'first_seen epoch ms')
+
+        const stored = getUser('628120@s.whatsapp.net')
+        assert.equal(stored.firstSeen, new Date(row.first_seen).toISOString())
     })
 })
 
-describe('lastSeen throttle (F-11)', () => {
-    test('lastSeen fresh di memori, persist disk dibatasi per menit', async () => {
+describe('lastSeen throttle sql', () => {
+    test('lastSeen fresh di memori, persist sql dibatasi per menit', () => {
         mock.timers.enable({ apis: ['Date'] })
         try {
             upsertUser({ jid: '628118@s.whatsapp.net', name: 'Throttle' })
-            await flushDirty()
-            const persisted = readJson(usersFile)['628118']
+            const persisted = prepare('SELECT last_seen FROM users WHERE key = ?').get('628118').last_seen
 
             mock.timers.tick(5000)
-            upsertUser({ jid: '628118@s.whatsapp.net', name: 'Throttle' })
-            await flushDirty()
+            const fresh = upsertUser({ jid: '628118@s.whatsapp.net', name: 'Throttle' })
+            const afterFiveSec = prepare('SELECT last_seen FROM users WHERE key = ?').get('628118').last_seen
 
-            assert.equal(readJson(usersFile)['628118'].lastSeen, persisted.lastSeen, 'belum 1 menit: tidak ada tulis ulang lastSeen')
-            assert.notEqual(upsertUser({ jid: '628118@s.whatsapp.net', name: 'Throttle' }).lastSeen, persisted.lastSeen, 'lastSeen memori tetap fresh')
+            assert.equal(afterFiveSec, persisted, 'belum 1 menit: tidak ada tulis ulang last_seen')
+            assert.notEqual(fresh.lastSeen, new Date(persisted).toISOString(), 'lastSeen memori tetap fresh')
 
             mock.timers.tick(61_000)
             upsertUser({ jid: '628118@s.whatsapp.net', name: 'Throttle' })
-            await flushDirty()
-            assert.notEqual(readJson(usersFile)['628118'].lastSeen, persisted.lastSeen, 'setelah 1 menit: lastSeen ter-persist')
-
-            users.delete('628118')
-            await flushDirty()
+            const afterMinute = prepare('SELECT last_seen FROM users WHERE key = ?').get('628118').last_seen
+            assert.notEqual(afterMinute, persisted, 'setelah 1 menit: lastSeen ter-persist')
         } finally {
             mock.timers.reset()
         }
     })
 })
 
-describe('group database', () => {
+describe('group database sql', () => {
     test('getGroupKey hanya menerima JID grup', () => {
         assert.equal(getGroupKey('123@g.us'), '123@g.us')
         assert.equal(getGroupKey('123@s.whatsapp.net'), null)
@@ -291,22 +185,104 @@ describe('group database', () => {
     test('upsertGroup membuat dan memperbarui record', () => {
         const created = upsertGroup({ jid: '111@g.us', name: 'Grup Satu' })
         assert.equal(created.name, 'Grup Satu')
+        assert.deepEqual(created.settings, {})
+        assert.ok(created.createdAt)
 
         const updated = upsertGroup({ jid: '111@g.us', name: 'Grup Baru' })
         assert.equal(updated.name, 'Grup Baru')
         assert.equal(updated.createdAt, created.createdAt)
         assert.equal(getGroup('111@g.us').jid, '111@g.us')
     })
+
+    test('upsertGroup menyimpan settings sebagai JSON dan hanya menulis saat berubah', () => {
+        const first = upsertGroup({ jid: '222@g.us', name: 'Setting', settings: { muted: true, level: 2 } })
+
+        const rowBefore = prepare('SELECT settings, created_at FROM wa_groups WHERE jid = ?').get('222@g.us')
+        const unchanged = upsertGroup({ jid: '222@g.us', name: 'Setting' })
+        const rowAfter = prepare('SELECT settings, created_at FROM wa_groups WHERE jid = ?').get('222@g.us')
+
+        assert.deepEqual(unchanged.settings, { muted: true, level: 2 })
+        assert.equal(rowAfter.settings, rowBefore.settings, 'settings tidak ditulis ulang tanpa perubahan')
+        assert.equal(rowAfter.created_at, rowBefore.created_at, 'createdAt dijaga')
+
+        upsertGroup({ jid: '222@g.us', settings: { muted: false } })
+        assert.deepEqual(getGroup('222@g.us').settings, { muted: false })
+        assert.equal(first.createdAt, getGroup('222@g.us').createdAt)
+    })
+
+    test('getGroup pada grup asing mengembalikan null', () => {
+        assert.equal(getGroup('999@g.us'), null)
+    })
 })
 
-describe('identity mapping collection', () => {
-    test('identityMappings persist pasangan pn-lid', async () => {
-        identityMappings.set('628111', '111222333444555')
-        await flushDirty()
+describe('settings helper sql', () => {
+    test('setSetting dan getSetting round-trip', () => {
+        setSetting('helper-key', { a: 1 })
+        assert.deepEqual(getSetting('helper-key'), { a: 1 })
 
-        assert.equal(readJson(path.join(tmpDb, 'identity.json'))['628111'], '111222333444555')
-        identityMappings.delete('628111')
-        await flushDirty()
+        setSetting('helper-key', { a: 2, b: 'x' })
+        assert.deepEqual(getSetting('helper-key'), { a: 2, b: 'x' })
+
+        assert.equal(getSetting('tidak-ada'), null)
+    })
+
+    test('setSetting menulis value json valid dengan updated_at', () => {
+        setSetting('stamp-key', { n: 1 })
+
+        const row = prepare('SELECT value, updated_at FROM settings WHERE key = ?').get('stamp-key')
+        assert.equal(row.updated_at > 1_600_000_000_000, true)
+        assert.deepEqual(JSON.parse(row.value), { n: 1 })
+    })
+})
+
+describe('limitReset sql', () => {
+    test('reset terjadi sekali per hari zona', () => {
+        resetDatabaseForTests()
+        updateConfig({ dailyLimit: 5 })
+
+        try {
+            upsertUser({ jid: '628777000111@s.whatsapp.net', name: 'Uji Zona' })
+            tryConsumeUserLimit('628777000111@s.whatsapp.net', 3)
+
+            const soreJakarta = new Date('2026-11-14T10:00:00Z')
+            const hasil1 = limitReset.checkLimitReset(soreJakarta)
+            assert.equal(hasil1.reset, true)
+            assert.equal(hasil1.day, '2026-11-14')
+            assert.equal(getUser('628777000111@s.whatsapp.net').limit, 5)
+
+            const hasil2 = limitReset.checkLimitReset(new Date('2026-11-14T12:00:00Z'))
+            assert.equal(hasil2.reset, false, 'hari zona yang sama tidak reset dua kali')
+        } finally {
+            updateConfig({ dailyLimit: 7 })
+        }
+    })
+})
+
+describe('paritas perilaku lama users', () => {
+    test('urutan operasi lama menghasilkan hasil sama', () => {
+        resetDatabaseForTests()
+
+        const a = upsertUser({ jid: '628201@s.whatsapp.net', name: 'A' })
+        const legacyA = { jid: '628201@s.whatsapp.net', name: 'A', firstSeen: a.firstSeen, lastSeen: a.lastSeen, limit: 7, premium: false, owner: false, creator: false }
+
+        consumeUserLimit('628201@s.whatsapp.net', 2)
+        legacyA.limit = 5
+        legacyA.lastSeen = getUser('628201@s.whatsapp.net').lastSeen
+
+        assert.deepEqual(getUser('628201@s.whatsapp.net'), { jid: legacyA.jid, name: legacyA.name, firstSeen: legacyA.firstSeen, lastSeen: legacyA.lastSeen, limit: legacyA.limit })
+
+        const b = tryConsumeUserLimit('628201@s.whatsapp.net', 5)
+        assert.equal(b.limit, 0)
+        assert.equal(tryConsumeUserLimit('628201@s.whatsapp.net', 1), false)
+
+        consumeUserLimit('628201@s.whatsapp.net', 3)
+        assert.equal(getUser('628201@s.whatsapp.net').limit, 0, 'consume memangkas minimal ke 0')
+
+        refundUserLimit('628201@s.whatsapp.net', 4)
+        assert.equal(getUser('628201@s.whatsapp.net').limit, 4)
+
+        resetAllUserLimits(9)
+        assert.equal(getUser('628201@s.whatsapp.net').limit, 9)
     })
 })
 

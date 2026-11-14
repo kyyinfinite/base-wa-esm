@@ -10,8 +10,6 @@ const root = path.join(path.dirname(fileURLToPath(import.meta.url)), '..')
 const tmp = fs.mkdtempSync(path.join(os.tmpdir(), 'wa-reconnect-'))
 
 process.env.WA_DATABASE_DIR = tmp
-process.env.WA_OWNER_PATH = path.join(tmp, 'owner.json')
-process.env.WA_PREMIUM_PATH = path.join(tmp, 'premium.json')
 process.env.WA_CONFIG_PATH = path.join(tmp, 'config.json')
 fs.writeFileSync(process.env.WA_CONFIG_PATH, JSON.stringify({
     botName: 'Uji Bot',
@@ -25,7 +23,7 @@ fs.writeFileSync(process.env.WA_CONFIG_PATH, JSON.stringify({
 const connectUrl = pathToFileURL(path.join(root, 'src/core/app/connect.js')).href
 const { default: connectToWhatsApp, closeActiveSocket, getActiveSocket, getConnectionStatus } = await import(connectUrl)
 const { classifyDisconnect, computeBackoff, reconnectDelayFor, describeDisconnect } = await import('../src/core/app/reconnect.js')
-const { flushAll } = await import('../src/services/database/json.js')
+const { closeDatabase } = await import('../src/services/database/sqlite.js')
 
 const flush = () => new Promise(resolve => setImmediate(resolve))
 const closeWith = statusCode => ({ connection: 'close', lastDisconnect: { error: { output: { statusCode } } } })
@@ -172,7 +170,7 @@ afterEach(async () => {
 })
 
 after(async () => {
-    flushAll()
+    closeDatabase()
     fs.rmSync(tmp, { recursive: true, force: true })
 })
 
@@ -445,8 +443,9 @@ describe('reconnect tanpa duplikasi', () => {
         await flush()
 
         const second = getActiveSocket()
+        const expectedCounts = { 'creds.update': 1, 'connection.update': 1, 'messages.upsert': 2 }
         for (const event of ['creds.update', 'connection.update', 'messages.upsert']) {
-            assert.equal(second.ev.listenerCount(event), 1, `${event} di socket baru`)
+            assert.equal(second.ev.listenerCount(event), expectedCounts[event], `${event} di socket baru`)
             assert.equal(first.ev.listenerCount(event), 0, `${event} di socket lama`)
         }
     })

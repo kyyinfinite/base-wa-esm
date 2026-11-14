@@ -13,6 +13,8 @@
   "botMode": "public",
   "dailyLimit": 10,
   "usePairingCode": true,
+  "enableShell": true,
+  "enableEval": true,
   "accessDenied": {
     "owner": "Perintah ini hanya dapat digunakan oleh owner.",
     "creator": "Perintah ini hanya dapat digunakan oleh creator.",

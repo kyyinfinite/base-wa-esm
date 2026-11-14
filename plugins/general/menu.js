@@ -145,5 +145,6 @@ handler.command = ['menu', 'help', 'general', 'game', 'snippet', 'owner', 'syste
 handler.help = ['menu', 'help']
 handler.tags = ['main']
 handler.description = 'Menampilkan daftar fitur bot dan pusat bantuan'
+handler.prefixless = true
 
 export default handler

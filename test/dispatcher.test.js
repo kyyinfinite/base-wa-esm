@@ -7,8 +7,6 @@ import crypto from 'crypto'
 
 const tmpDisp = fs.mkdtempSync(path.join(os.tmpdir(), 'wa-disp-'))
 process.env.WA_DATABASE_DIR = tmpDisp
-process.env.WA_OWNER_PATH = path.join(tmpDisp, 'owner.json')
-process.env.WA_PREMIUM_PATH = path.join(tmpDisp, 'premium.json')
 process.env.WA_CONFIG_PATH = path.join(tmpDisp, 'config.json')
 fs.writeFileSync(process.env.WA_CONFIG_PATH, JSON.stringify({
     botName: 'Uji Bot',
@@ -23,9 +21,9 @@ const { parseCommand, parseButtonResponse, matchPatternPlugin } = await import('
 const { extractCommandFromMessage, normalizeMessage } = await import('../src/core/message/normalize.js')
 const { smsg } = await import('../src/utils/myfunc.js')
 const { registerPlugin, unregisterPlugin, getKeysOf, metadata } = await import('../src/core/plugin/registry.js')
-const { upsertUser, getUser } = await import('../src/services/database/users.js')
+const { upsertUser, getUser, consumeUserLimit } = await import('../src/services/database/users.js')
 const { updateConfig, getConfig } = await import('../src/services/config.js')
-const { flushAll } = await import('../src/services/database/json.js')
+const { prepare, closeDatabase } = await import('../src/services/database/sqlite.js')
 const handleMessage = (await import('../src/core/dispatcher/dispatcher.js')).default
 const { clearCooldowns } = await import('../src/core/middleware/cooldown.js')
 const { setResolverSocket, resetResolverState } = await import('../src/services/identity-resolver.js')
@@ -91,7 +89,7 @@ const plugin = (fn, meta = {}) => {
 before(() => {
     register('test://ping', plugin(async (m, { conn }) => {
         await conn.sendMessage(m.chat, { text: 'pong' }, { quoted: m })
-    }, { command: ['e2eping'] }))
+    }, { command: ['e2eping'], prefixless: true }))
 
     register('test://owner', plugin(async (m, { conn }) => {
         await conn.sendMessage(m.chat, { text: 'owner-ok' }, { quoted: m })
@@ -138,7 +136,7 @@ after(() => {
     for (const file of pluginsToClean) {
         unregisterPlugin(file, getKeysOf(file))
     }
-    flushAll()
+    closeDatabase()
     fs.rmSync(tmpDisp, { recursive: true, force: true })
 })
 
@@ -151,11 +149,11 @@ beforeEach(() => {
 describe('command parsing', () => {
     test('prefix + command + args', () => {
         const parsed = parseCommand({ text: '.menu 1 2' }, ['.'])
-        assert.deepEqual(parsed, { prefix: '.', command: 'menu', args: ['1', '2'], text: '1 2' })
+        assert.deepEqual(parsed, { prefix: '.', command: 'menu', args: ['1', '2'], text: '1 2', rawText: '1 2' })
     })
 
     test('command tanpa prefix jika single word', () => {
-        assert.deepEqual(parseCommand({ text: 'menu' }, ['.']), { prefix: '', command: 'menu', args: [], text: '' })
+        assert.deepEqual(parseCommand({ text: 'menu' }, ['.']), { prefix: '', command: 'menu', args: [], text: '', rawText: '' })
     })
 
     test('multiword tanpa prefix ditolak', () => {
@@ -175,17 +173,17 @@ describe('command parsing', () => {
     })
 
     test('prefix multi-karakter dipakai sesuai urutan config', () => {
-        assert.deepEqual(parseCommand({ text: '#ping x' }, ['.', '#']), { prefix: '#', command: 'ping', args: ['x'], text: 'x' })
+        assert.deepEqual(parseCommand({ text: '#ping x' }, ['.', '#']), { prefix: '#', command: 'ping', args: ['x'], text: 'x', rawText: 'x' })
     })
 })
 
 describe('button response parsing', () => {
     test('id tanpa prefix', () => {
-        assert.deepEqual(parseButtonResponse({ text: 'menu' }, ['.']), { prefix: '', command: 'menu', args: [], text: '' })
+        assert.deepEqual(parseButtonResponse({ text: 'menu' }, ['.']), { prefix: '', command: 'menu', args: [], text: '', rawText: '' })
     })
 
     test('id dengan prefix', () => {
-        assert.deepEqual(parseButtonResponse({ text: '.sc extra' }, ['.']), { prefix: '.', command: 'sc', args: ['extra'], text: 'extra' })
+        assert.deepEqual(parseButtonResponse({ text: '.sc extra' }, ['.']), { prefix: '.', command: 'sc', args: ['extra'], text: 'extra', rawText: 'extra' })
     })
 
     test('body kosong ditolak', () => {
@@ -422,10 +420,7 @@ describe('dispatcher end-to-end', () => {
     })
 
     test('plugin gagal mengembalikan limit yang di-reserve', async () => {
-        const { users } = await import('../src/services/database/json.js')
-        const rec = upsertUser({ jid: '628446@s.whatsapp.net', name: 'Refunder' })
-        rec.limit = 5
-        users.set('628446', rec)
+        upsertUser({ jid: '628446@s.whatsapp.net', name: 'Refunder' })
 
         const file = 'test://refundthrow'
         register(file, plugin(async () => {
@@ -442,10 +437,8 @@ describe('dispatcher end-to-end', () => {
     })
 
     test('limit habis memblokir plugin', async () => {
-        const poor = upsertUser({ jid: '628444@s.whatsapp.net', name: 'Poor' })
-        poor.limit = 0
-        const { users } = await import('../src/services/database/json.js')
-        users.set('628444', poor)
+        upsertUser({ jid: '628444@s.whatsapp.net', name: 'Poor' })
+        consumeUserLimit('628444@s.whatsapp.net', 5)
 
         const conn = makeConn()
         await handleMessage(conn, makeM('.e2elimit', { sender: '628444@s.whatsapp.net' }))
@@ -454,10 +447,7 @@ describe('dispatcher end-to-end', () => {
     })
 
     test('limit cukup dieksekusi dan dikurangi', async () => {
-        const rich = upsertUser({ jid: '628445@s.whatsapp.net', name: 'Rich' })
-        rich.limit = 5
-        const { users } = await import('../src/services/database/json.js')
-        users.set('628445', rich)
+        upsertUser({ jid: '628445@s.whatsapp.net', name: 'Rich' })
 
         const conn = makeConn()
         await handleMessage(conn, makeM('.e2elimit', { sender: '628445@s.whatsapp.net' }))
